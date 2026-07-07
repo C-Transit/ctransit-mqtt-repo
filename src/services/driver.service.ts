@@ -131,13 +131,27 @@ async function listDrivers() {
 
   // Map: matricNumber → terminal — O(1) lookups in the merge below
   const terminalByDriver = new Map(
-    activeTerminals.map((t) => [t.active_driver_uid, t])
+    activeTerminals.map(
+      (t: {
+        terminal_id: string;
+        status: string;
+        active_driver_uid: string | null;
+      }) => [t.active_driver_uid, t]
+    )
   );
 
-  return drivers.map((driver) => ({
-    ...driver,
-    activeTerminal: terminalByDriver.get(driver.matricNumber) ?? null,
-  }));
+  return drivers.map(
+    (driver: {
+      id: string;
+      firstname: string;
+      lastname: string;
+      matricNumber: string;
+      createdAt: Date;
+    }) => ({
+      ...driver,
+      activeTerminal: terminalByDriver.get(driver.matricNumber) ?? null,
+    })
+  );
 }
 
 // ─────────────────────────────────────────────

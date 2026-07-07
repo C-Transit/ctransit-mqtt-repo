@@ -154,7 +154,9 @@ async function handleFullSyncRequest(
       select: { card_uid: true },
     });
 
-    const whitelistUids = cardMappings.map((c) => c.card_uid);
+    const whitelistUids = cardMappings.map(
+      (c: { card_uid: string }) => c.card_uid
+    );
 
     // Fetch blacklist — all blacklisted wallets
     const blacklistedMappings = await prisma.cardMapping.findMany({
@@ -162,13 +164,17 @@ async function handleFullSyncRequest(
         student_uid: {
           in: await prisma.blacklist
             .findMany({ select: { student_uid: true } })
-            .then((bl) => bl.map((b) => b.student_uid)),
+            .then((bl: { student_uid: string }[]) =>
+              bl.map((b: { student_uid: string }) => b.student_uid)
+            ),
         },
       },
       select: { card_uid: true },
     });
 
-    const blacklistUids = blacklistedMappings.map((c) => c.card_uid);
+    const blacklistUids = blacklistedMappings.map(
+      (c: { card_uid: string }) => c.card_uid
+    );
 
     log.info(
       {

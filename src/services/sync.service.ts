@@ -90,24 +90,26 @@ async function broadcastDeltaToFleet(deltaCommand: string): Promise<void> {
 
     log.info({ terminalCount: terminals.length }, "sync.fleet_broadcast_start");
 
-    const promises = terminals.map(async (t) => {
-      const qLog = log.child({ terminalId: t.terminal_id });
-      try {
-        if (t.status === "ONLINE" && _mqttPublish) {
-          await _mqttPublish(t.terminal_id, deltaCommand);
-          qLog.debug("sync.broadcast_published_direct");
-        } else {
-          await redis.rpush(
-            redisKeys.terminalQueue(t.terminal_id),
-            deltaCommand
-          );
-          qLog.debug("sync.broadcast_queued_redis");
+    const promises = terminals.map(
+      async (t: { terminal_id: string; status: string }) => {
+        const qLog = log.child({ terminalId: t.terminal_id });
+        try {
+          if (t.status === "ONLINE" && _mqttPublish) {
+            await _mqttPublish(t.terminal_id, deltaCommand);
+            qLog.debug("sync.broadcast_published_direct");
+          } else {
+            await redis.rpush(
+              redisKeys.terminalQueue(t.terminal_id),
+              deltaCommand
+            );
+            qLog.debug("sync.broadcast_queued_redis");
+          }
+        } catch (err) {
+          const errMsg = err instanceof Error ? err.message : "Unknown error";
+          qLog.error({ err: errMsg }, "sync.broadcast_routing_failed");
         }
-      } catch (err) {
-        const errMsg = err instanceof Error ? err.message : "Unknown error";
-        qLog.error({ err: errMsg }, "sync.broadcast_routing_failed");
       }
-    });
+    );
 
     await Promise.allSettled(promises);
     log.info("sync.fleet_broadcast_complete");

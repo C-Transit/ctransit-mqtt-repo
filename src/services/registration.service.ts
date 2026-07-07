@@ -164,7 +164,9 @@ async function confirmRegistration(
       select: { terminal_id: true },
     });
     await Promise.allSettled(
-      allTerminals.map((t) => routeDeltaToTerminal(t.terminal_id, addWlCmd))
+      allTerminals.map((t: { terminal_id: string }) =>
+        routeDeltaToTerminal(t.terminal_id, addWlCmd)
+      )
     );
     log.info(
       { terminalCount: allTerminals.length },

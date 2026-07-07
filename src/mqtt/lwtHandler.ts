@@ -1,7 +1,8 @@
 import { prisma } from "../services/ledger.service.js";
 import { flushTerminalQueue } from "../services/sync.service.js";
 import logger from "../config/logger.js";
-import type { TerminalStatus } from "@prisma/client";
+
+type TerminalStatus = "ONLINE" | "OFFLINE" | "LOCKED";
 
 async function handleLwtEvent(
   terminalId: string,
