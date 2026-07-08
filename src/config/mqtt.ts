@@ -17,15 +17,13 @@ interface MqttConfig {
 }
 
 const mqttConfig: MqttConfig = {
-  brokerUrl: `mqtt://${env.mqtt.host}:${env.mqtt.port}`,
+  brokerUrl: `mqtts://${env.mqtt.host}:${env.mqtt.port}`,
 
   options: {
     clientId: env.mqtt.clientId,
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    username: (env.mqtt as any).username,
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    password: (env.mqtt as any).password,
-    protocol: "mqtt",
+    username: env.mqtt.username, 
+    password: env.mqtt.password, 
+    protocol: "mqtts",
     port: env.mqtt.port,
     rejectUnauthorized: false,
     keepalive: 60,
@@ -34,7 +32,7 @@ const mqttConfig: MqttConfig = {
     clean: false,
     will: {
       topic: "ctransit/server/status",
-      payload: "OFFLINE", // Note: Some MQTT typings prefer Buffer.from("OFFLINE") here
+      payload: "OFFLINE",
       qos: 1,
       retain: true,
     },
