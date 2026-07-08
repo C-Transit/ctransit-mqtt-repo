@@ -20,7 +20,6 @@ const mqttConfig: MqttConfig = {
   brokerUrl: `mqtts://${env.mqtt.host}:${env.mqtt.port}`,
 
   options: {
-    // ✅ Appends a random suffix so local and production can co-exist
     clientId: `${env.mqtt.clientId}_${Math.random()
       .toString(16)
       .substring(2, 6)}`,
