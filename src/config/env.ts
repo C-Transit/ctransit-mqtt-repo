@@ -9,6 +9,7 @@ const REQUIRED_VARS = [
   "MQTT_PASSWORD",
   "HIVEMQ_CLUSTER_URL",
   "HIVEMQ_PORT",
+  "HIVEMQ_CLIENT_ID"
 ] as const;
 
 const missing = REQUIRED_VARS.filter((key) => !process.env[key]);
@@ -49,6 +50,7 @@ interface Config {
   mqtt: {
     host: string;
     port: number;
+    clientId: string;
   };
   redis: {
     url: string;
@@ -68,6 +70,7 @@ const env: Config = {
   mqtt: {
     host: process.env.HIVEMQ_CLUSTER_URL as string,
     port: parseIntSafe(process.env.HIVEMQ_PORT, 8883),
+    clientId: process.env.HIVEMQ_CLIENT_ID as string,
   },
   redis: {
     url: process.env.REDIS_URL as string,
