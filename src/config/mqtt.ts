@@ -20,7 +20,6 @@ const mqttConfig: MqttConfig = {
   brokerUrl: `mqtt://${env.mqtt.host}:${env.mqtt.port}`,
 
   options: {
-    clientId: env.mqtt.clientId,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     username: (env.mqtt as any).username,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
