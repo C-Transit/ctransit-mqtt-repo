@@ -78,7 +78,10 @@ async function routeUplinkMessage(
   }
 */
 
-  const payload = rawMessage; // Bypass HMAC verification for now
+  const prefix = `${terminalId}:`;
+  const payload = rawMessage.startsWith(prefix)
+    ? rawMessage.substring(prefix.length)
+    : rawMessage;
 
   const payloadType = detectPayloadType(payload);
   log.debug(
