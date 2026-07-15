@@ -10,6 +10,7 @@ const REQUIRED_VARS = [
   "HIVEMQ_CLUSTER_URL",
   "HIVEMQ_PORT",
   "HIVEMQ_CLIENT_ID",
+  "JWT_SECRET",
 ] as const;
 
 const missing = REQUIRED_VARS.filter((key) => !process.env[key]);
@@ -60,6 +61,9 @@ interface Config {
   ledger: {
     baseFare: number;
   };
+  jwt: {
+    secret: string;
+  };
 }
 
 const env: Config = {
@@ -81,6 +85,9 @@ const env: Config = {
   },
   ledger: {
     baseFare: parseFloatSafe(process.env.BASE_FARE, 150),
+  },
+  jwt: {
+    secret: process.env.JWT_SECRET as string,
   },
 };
 
