@@ -2,7 +2,6 @@
 import "dotenv/config";
 
 const REQUIRED_VARS = [
-  "HIVEMQ_HOST",
   "HIVEMQ_PORT",
   "HIVEMQ_CLIENT_ID",
   "DATABASE_URL",
@@ -47,7 +46,6 @@ interface Config {
     pooledUrl: string;
   };
   mqtt: {
-    host: string;
     port: number;
     clientId: string;
     username: string;
@@ -72,7 +70,6 @@ const env: Config = {
     pooledUrl: process.env.DATABASE_URL_POOLED as string,
   },
   mqtt: {
-    host: process.env.HIVEMQ_HOST as string,
     port: parseIntSafe(process.env.HIVEMQ_PORT, 1883),
     clientId: process.env.HIVEMQ_CLIENT_ID as string,
     username: process.env.HIVEMQ_USERNAME as string,
