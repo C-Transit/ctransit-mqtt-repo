@@ -170,7 +170,7 @@ async function processTransaction(
             student_uid: matricNumber,
             amount: tx.amount,
             driver_uid: driverUid,
-            synced_at: tx.synced_at,
+            synced_at: new Date(),
           },
         });
 
