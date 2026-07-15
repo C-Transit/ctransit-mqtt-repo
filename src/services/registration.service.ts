@@ -1,15 +1,11 @@
+// src/services/registration.service.ts
 "use strict";
 
-import {
-  getRedisClient,
-  redisKeys,
-  cacheKeys, // ✅ Added — needed for cache invalidation
-  OTP_TTL_SECONDS,
-} from "../config/redis.js";
 import { activateWallet, prisma } from "./ledger.service.js";
 import { buildDeltaCommand, type PendingLinkData } from "../utils/parser.js";
 import { routeDeltaToTerminal } from "./sync.service.js";
 import { publishToTerminal } from "../mqtt/downlinkQueue.js";
+import { getRedisClient, cacheKeys } from "../config/redis.js";
 import logger from "../config/logger.js";
 
 export interface ConfirmRegistrationResult {
@@ -19,27 +15,42 @@ export interface ConfirmRegistrationResult {
   cardUid?: string;
 }
 
+// ─────────────────────────────────────────────
+// handlePendingLink
+// Terminal sends PENDING_LINK when a card is tapped.
+// OTP is now persisted to DB (registration_otps table)
+// instead of Redis. TTL enforced via expires_at field.
+// ─────────────────────────────────────────────
 async function handlePendingLink(
   terminalId: string,
   linkData: PendingLinkData
 ): Promise<void> {
-  const redis = getRedisClient();
   const log = logger.child({
     terminalId,
     cardUid: linkData.uid,
     otp: linkData.otp,
   });
 
-  const key = redisKeys.linkOtp(linkData.otp);
+  const expiresAt = new Date(Date.now() + 5 * 60 * 1000); // 5 minutes
 
-  // Store: otp -> cardUid|terminalId
-  const value = `${linkData.uid}|${terminalId}`;
-  await redis.setex(key, OTP_TTL_SECONDS, value);
+  // Upsert — if same card taps again, refresh the OTP record
+  await prisma.registrationOtp.upsert({
+    where: { otp: linkData.otp },
+    update: {
+      card_uid: linkData.uid,
+      terminal_id: terminalId,
+      expires_at: expiresAt,
+      used: false,
+    },
+    create: {
+      otp: linkData.otp,
+      card_uid: linkData.uid,
+      terminal_id: terminalId,
+      expires_at: expiresAt,
+    },
+  });
 
-  log.info(
-    { ttlSeconds: OTP_TTL_SECONDS, cacheKey: key },
-    "registration.otp_cached"
-  );
+  log.info({ expiresAt, otp: linkData.otp }, "registration.otp_saved_to_db");
 
   try {
     await publishToTerminal(terminalId, `REG:OTP,${linkData.otp}`);
@@ -50,17 +61,24 @@ async function handlePendingLink(
   }
 }
 
+// ─────────────────────────────────────────────
+// confirmRegistration
+// Called when student submits OTP from frontend.
+// Looks up OTP in DB, validates, links card,
+// activates wallet, and broadcasts ADD:WL.
+// ─────────────────────────────────────────────
 async function confirmRegistration(
   otp: string,
   userId: string
 ): Promise<ConfirmRegistrationResult> {
-  const redis = getRedisClient();
   const log = logger.child({ otp, userId });
 
-  const key = redisKeys.linkOtp(otp);
-  const cached = await redis.get(key);
+  // Look up OTP in DB
+  const otpRecord = await prisma.registrationOtp.findUnique({
+    where: { otp },
+  });
 
-  if (!cached) {
+  if (!otpRecord || otpRecord.used || otpRecord.expires_at < new Date()) {
     log.warn("registration.otp_not_found_or_expired");
     return {
       success: false,
@@ -68,15 +86,7 @@ async function confirmRegistration(
     };
   }
 
-  const [cardUid, originTerminalId] = cached.split("|");
-
-  if (!cardUid || !originTerminalId) {
-    log.error({ cached }, "registration.malformed_cache_value");
-    return {
-      success: false,
-      message: "Internal registration state corrupted.",
-    };
-  }
+  const { card_uid: cardUid, terminal_id: originTerminalId } = otpRecord;
 
   const user = await prisma.user.findUnique({
     where: { id: userId },
@@ -102,14 +112,6 @@ async function confirmRegistration(
       { matricNumber: user.matricNumber },
       "registration.wallet_activated"
     );
-
-    // ✅ Invalidate wallet cache — wallet was just created/activated.
-    // Next tap reads fresh wallet state from DB instead of stale null.
-    await redis.del(cacheKeys.wallet(user.matricNumber));
-    log.debug(
-      { matricNumber: user.matricNumber },
-      "registration.wallet_cache_invalidated"
-    );
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : "Unknown error";
     log.error({ err: errMsg }, "registration.wallet_activation_failed");
@@ -133,18 +135,18 @@ async function confirmRegistration(
     "registration.card_uid_mapped_to_student"
   );
 
-  // ✅ Invalidate card mapping cache — card_uid now points to a new matricNumber.
-  // Without this, ingestion.service.ts would serve the old (stale) mapping from
-  // cache if this card was previously linked to a different student.
+  // Invalidate card map cache — new mapping must be picked up immediately
+  const redis = getRedisClient();
   await redis.del(cacheKeys.cardMap(cardUid));
   log.debug({ cardUid }, "registration.card_map_cache_invalidated");
 
-  // Consume OTP — cannot be reused
-  await redis.del(key);
-  log.debug({ key }, "registration.otp_consumed_from_redis");
+  // Mark OTP as used — cannot be reused
+  await prisma.registrationOtp.update({
+    where: { otp },
+    data: { used: true },
+  });
+  log.debug({ otp }, "registration.otp_consumed");
 
-  // Broadcast ADD:WL,cardUid to all terminals
-  // Uses cardUid (not matricNumber) — terminals identify cards by hardware UID
   const addWlCmd = buildDeltaCommand("ADD", "WL", cardUid);
 
   try {

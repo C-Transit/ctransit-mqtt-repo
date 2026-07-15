@@ -1,6 +1,7 @@
+// src/services/sync.service.ts — full replacement
 "use strict";
 
-import { getRedisClient, redisKeys, cacheKeys } from "../config/redis.js"; // ✅ Added cacheKeys
+import { getRedisClient, redisKeys } from "../config/redis.js";
 import logger from "../config/logger.js";
 import { prisma } from "./ledger.service.js";
 
@@ -64,20 +65,8 @@ async function broadcastDeltaToFleet(deltaCommand: string): Promise<void> {
   const redis = getRedisClient();
 
   try {
-    // ✅ REM:BL means a student topped up and was removed from the blacklist.
-    // Invalidate their blacklist cache entry immediately — don't wait for the
-    // 60s TTL to expire, otherwise their next tap would still be rejected.
-    // Format of deltaCommand: "REM:BL,matricNumber"
-    if (deltaCommand.startsWith("REM:BL,")) {
-      const matricNumber = deltaCommand.split(",")[1];
-      if (matricNumber) {
-        await redis.del(cacheKeys.blacklist(matricNumber));
-        log.debug(
-          { matricNumber },
-          "sync.blacklist_cache_invalidated_on_rem_bl"
-        );
-      }
-    }
+    // Blacklist cache removed — no cache invalidation needed here.
+    // DB is now the source of truth for blacklist status on every tap.
 
     const terminals = await prisma.terminal.findMany({
       select: { terminal_id: true, status: true },
