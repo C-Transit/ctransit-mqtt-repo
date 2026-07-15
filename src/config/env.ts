@@ -2,13 +2,14 @@
 import "dotenv/config";
 
 const REQUIRED_VARS = [
-  "HIVEMQ_HOST",
-  "HIVEMQ_PORT",
-  "HIVEMQ_CLIENT_ID",
   "DATABASE_URL",
   "DATABASE_URL_POOLED",
   "REDIS_URL",
-  "JWT_SECRET",
+  "MQTT_USERNAME",
+  "MQTT_PASSWORD",
+  "HIVEMQ_CLUSTER_URL",
+  "HIVEMQ_PORT",
+  "HIVEMQ_CLIENT_ID",
 ] as const;
 
 const missing = REQUIRED_VARS.filter((key) => !process.env[key]);
@@ -59,9 +60,6 @@ interface Config {
   ledger: {
     baseFare: number;
   };
-  jwt: {
-    secret: string;
-  };
 }
 
 const env: Config = {
@@ -72,20 +70,17 @@ const env: Config = {
     pooledUrl: process.env.DATABASE_URL_POOLED as string,
   },
   mqtt: {
-    host: process.env.HIVEMQ_HOST as string,
-    port: parseIntSafe(process.env.HIVEMQ_PORT, 1883),
+    host: process.env.HIVEMQ_CLUSTER_URL as string,
+    port: parseIntSafe(process.env.HIVEMQ_PORT, 8883),
     clientId: process.env.HIVEMQ_CLIENT_ID as string,
-    username: process.env.HIVEMQ_USERNAME as string,
-    password: process.env.HIVEMQ_PASSWORD as string,
+    username: process.env.MQTT_USERNAME as string,
+    password: process.env.MQTT_PASSWORD as string,
   },
   redis: {
     url: process.env.REDIS_URL as string,
   },
   ledger: {
     baseFare: parseFloatSafe(process.env.BASE_FARE, 150),
-  },
-  jwt: {
-    secret: process.env.JWT_SECRET as string,
   },
 };
 
