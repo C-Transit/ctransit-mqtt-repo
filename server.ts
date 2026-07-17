@@ -14,6 +14,7 @@ import {
   stopBroadcastConsumer,
 } from "./src/consumer/broadcast.consumer.js";
 import healthRouter from "./src/routes/health.routes.js";
+import internalRouter from "./src/routes/internal.routes.js";
 import logger from "./src/config/logger.js";
 import env from "./src/config/env.js";
 
@@ -24,6 +25,7 @@ app.use(express.json());
 app.use(cors());
 
 app.use("/health", healthRouter);
+app.use("/internal", internalRouter);
 
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found" });

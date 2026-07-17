@@ -8,10 +8,9 @@ import {
   type DriverRegisterData,
 } from "../utils/parser.js";
 // uplinkRouter.ts — add import at top
-import { verifyAndUnwrap } from "../services/hmac.service.js";
 import { ingestTransactionBatch } from "../services/ingestion.service.js";
 import { handlePendingLink } from "../services/registration.service.js";
-import { handleLwtEvent } from "./lwtHandler.js";
+ 
 import logger from "../config/logger.js";
 import type { Logger } from "pino";
 import { prisma } from "../services/ledger.service.js";

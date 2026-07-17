@@ -10,6 +10,7 @@ const REQUIRED_VARS = [
   "HIVEMQ_CLUSTER_URL",
   "HIVEMQ_PORT",
   "HIVEMQ_CLIENT_ID",
+  "MQTT_INTERNAL_SECRET",
   "JWT_SECRET",
 ] as const;
 
@@ -54,6 +55,7 @@ interface Config {
     clientId: string;
     username: string;
     password: string;
+    internalSecret: string;
   };
   redis: {
     url: string;
@@ -79,6 +81,7 @@ const env: Config = {
     clientId: process.env.HIVEMQ_CLIENT_ID as string,
     username: process.env.MQTT_USERNAME as string,
     password: process.env.MQTT_PASSWORD as string,
+    internalSecret: process.env.MQTT_INTERNAL_SECRET as string,
   },
   redis: {
     url: process.env.REDIS_URL as string,

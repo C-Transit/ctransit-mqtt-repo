@@ -98,9 +98,7 @@ async function verifyAndUnwrap(
 
 // No-op now — kept so admin.controller.ts import doesn't break
 // if it's still referenced anywhere. Safe to remove later.
-async function invalidateTerminalSecretCache(
-  _terminalId: string
-): Promise<void> {
+async function invalidateTerminalSecretCache(): Promise<void> {
   // Terminal secret cache removed — nothing to invalidate
 }
 
