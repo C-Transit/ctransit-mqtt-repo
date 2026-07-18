@@ -3,6 +3,7 @@ import { validateApiKey } from "../middleware/api.middleware.js";
 import {
   handleBroadcast,
   handleRoute,
+  testDeduct,
 } from "../controller/internal.controller.js";
 import { syncFullListsToTerminal } from "../services/sync.service.js";
 
@@ -18,5 +19,6 @@ router.post("/test-sync/:terminalId", validateApiKey, async (req, res) => {
   await syncFullListsToTerminal(terminalId);
   res.json({ success: true });
 });
+router.post("/test-deduct", testDeduct);
 
 export default router;
