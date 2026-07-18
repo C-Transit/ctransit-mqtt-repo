@@ -107,3 +107,41 @@ export const handleRoute = async (req: Request, res: Response) => {
   await routeDeltaToTerminal(terminalId, command);
   res.json({ success: true, terminalId, command });
 };
+
+export const testBlacklistRemoval = async (req: Request, res: Response) => {
+  const { studentUid } = req.body;
+
+  if (!studentUid) {
+    return res.status(400).json({ error: "Missing studentUid" });
+  }
+
+  // Get card UID
+  const cardMap = await prisma.cardMapping.findUnique({
+    where: { student_uid: studentUid },
+    select: { card_uid: true },
+  });
+
+  if (!cardMap) {
+    return res.status(404).json({ error: "No card linked to this student" });
+  }
+
+  // Broadcast REM:BL
+  const command = buildDeltaCommand("REM", "BL", cardMap.card_uid);
+  await broadcastDeltaToFleet(command);
+
+  // Remove from DB
+  await prisma.blacklist.deleteMany({
+    where: { student_uid: studentUid },
+  });
+
+  logger.info(
+    { studentUid, cardUid: cardMap.card_uid, command },
+    "test.blacklist_removed"
+  );
+
+  res.json({
+    success: true,
+    cardUid: cardMap.card_uid,
+    command,
+  });
+};
