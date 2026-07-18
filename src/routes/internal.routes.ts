@@ -21,4 +21,5 @@ router.post("/test-sync/:terminalId", validateApiKey, async (req, res) => {
 });
 router.post("/test-deduct", testDeduct);
 
+
 export default router;
