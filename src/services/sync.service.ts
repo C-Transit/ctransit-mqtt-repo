@@ -4,6 +4,8 @@
 import { getRedisClient, redisKeys } from "../config/redis.js";
 import logger from "../config/logger.js";
 import { prisma } from "./ledger.service.js";
+import { buildChunks } from "../utils/parser.js";
+import { publishToTerminal } from "../mqtt/downlinkQueue.js";
 
 export type MqttPublishFn = (
   terminalId: string,
@@ -154,9 +156,86 @@ async function flushTerminalQueue(terminalId: string): Promise<void> {
   }
 }
 
+/**
+  * Sends the full whitelist (all card UIDs) and blacklist (card UIDs of blacklisted students)
+  * to a specific terminal.
+  * 
+  * Order: BL first, then WL, then SYNC_COMPLETE.
+  */
+async function syncFullListsToTerminal(terminalId: string): Promise<void> {
+   const log = logger.child({ terminalId });
+  const MAX_CHUNK_BYTES = 500;
+   const SYNC_DELAY_MS = 2000;
+   const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+   try {
+     // 1. Fetch whitelist – all card UIDs
+    const cardMappings = await prisma.cardMapping.findMany({
+       select: { card_uid: true },
+     });
+     const whitelistUids = cardMappings.map(c => c.card_uid);
+
+     // 2. Fetch blacklist – get card UIDs for blacklisted students
+     const blacklistedStudents = await prisma.blacklist.findMany({
+       select: { student_uid: true },
+     });
+     let blacklistUids: string[] = [];
+     if (blacklistedStudents.length > 0) {
+       const studentUids = blacklistedStudents.map(b => b.student_uid);
+       const blacklistCards = await prisma.cardMapping.findMany({
+         where: { student_uid: { in: studentUids } },
+         select: { card_uid: true },
+       });
+       blacklistUids = blacklistCards.map(c => c.card_uid);
+     }
+
+     log.info(
+       { wlCount: whitelistUids.length, blCount: blacklistUids.length },
+       'sync.full_lists_fetched'
+     );
+
+     // 3. Send BL first
+     if (blacklistUids.length === 0) {
+       await publishToTerminal(terminalId, 'SYS:BL,EMPTY');
+     } else {
+       const blChunks = buildChunks('SYS:BL,', blacklistUids, MAX_CHUNK_BYTES);
+       for (let i = 0; i < blChunks.length; i++) {
+         await publishToTerminal(terminalId, blChunks[i]);
+         log.debug({ chunk: i+1, total: blChunks.length }, 'sync.bl_chunk_sent');
+         if (i < blChunks.length - 1) await sleep(SYNC_DELAY_MS);
+       }
+     }
+
+     await sleep(SYNC_DELAY_MS);
+
+     // 4. Send WL
+    if (whitelistUids.length === 0) {
+       await publishToTerminal(terminalId, 'SYS:WL,EMPTY');
+     } else {
+       const wlChunks = buildChunks('SYS:WL,', whitelistUids, MAX_CHUNK_BYTES);
+       for (let i = 0; i < wlChunks.length; i++) {
+         await publishToTerminal(terminalId, wlChunks[i]);
+         log.debug({ chunk: i+1, total: wlChunks.length }, 'sync.wl_chunk_sent');
+         if (i < wlChunks.length - 1) await sleep(SYNC_DELAY_MS);
+      }
+     }
+
+     await sleep(SYNC_DELAY_MS);
+
+     // 5. Signal completion
+     await publishToTerminal(terminalId, 'SYS:SYNC_COMPLETE');
+     log.info('sync.full_sync_complete');
+   } catch (error) {
+     const errMessage = error instanceof Error ? error.message : 'Unknown error';
+     log.error({ err: errMessage }, 'sync.full_sync_error');
+     throw error;
+   }
+ }
+
 export {
   injectMqttPublisher,
   routeDeltaToTerminal,
   broadcastDeltaToFleet,
   flushTerminalQueue,
+  syncFullListsToTerminal,
 };

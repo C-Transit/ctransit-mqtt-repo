@@ -1,5 +1,5 @@
 import { prisma } from "../services/ledger.service.js";
-import { flushTerminalQueue } from "../services/sync.service.js";
+import { flushTerminalQueue, syncFullListsToTerminal } from "../services/sync.service.js";
 import logger from "../config/logger.js";
 
 type TerminalStatus = "ONLINE" | "OFFLINE" | "LOCKED";
@@ -39,11 +39,17 @@ async function handleLwtEvent(
 
     if (status === "ONLINE") {
       log.info("lwt.terminal_online — flushing redis queue");
-      flushTerminalQueue(terminalId).catch((error: unknown) => {
+      await flushTerminalQueue(terminalId).catch((error: unknown) => {
         const errMessage =
           error instanceof Error ? error.message : "Unknown error";
         log.error({ err: errMessage }, "lwt.queue_flush_error");
       });
+      // After flush, send full WL + BL
+    await syncFullListsToTerminal(terminalId).catch((error: unknown) => {
+       const errMessage =
+         error instanceof Error ? error.message : "Unknown error";
+       log.error({ err: errMessage }, "lwt.full_sync_error");
+     });
     } else {
       log.info("lwt.terminal_offline — status locked in db");
     }

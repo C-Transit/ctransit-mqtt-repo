@@ -262,3 +262,37 @@ export function buildDeltaCommand(
   const base = `${action}:${target},${uid}`;
   return extra ? `${base},${extra}` : base;
 }
+
+// src/utils/parser.ts – add this function
+
+/**
+ * Splits an array of UIDs into chunks with a maximum byte size.
+ * Used for SYS:WL and SYS:BL commands to respect MTU limits.
+ */
+export function buildChunks(
+  prefix: string,
+  uids: string[],
+  maxBytes: number
+): string[] {
+  const chunks: string[] = [];
+  let currentChunk: string[] = [];
+  let currentSize = prefix.length;
+
+  for (const uid of uids) {
+    const segment = currentChunk.length === 0 ? uid : `|${uid}`;
+    if (currentSize + segment.length > maxBytes) {
+      chunks.push(`${prefix}${currentChunk.join("|")}`);
+      currentChunk = [uid];
+      currentSize = prefix.length + uid.length;
+    } else {
+      currentChunk.push(uid);
+      currentSize += segment.length;
+    }
+  }
+
+  if (currentChunk.length > 0) {
+    chunks.push(`${prefix}${currentChunk.join("|")}`);
+  }
+
+  return chunks;
+}

@@ -10,10 +10,10 @@ import {
 // uplinkRouter.ts — add import at top
 import { ingestTransactionBatch } from "../services/ingestion.service.js";
 import { handlePendingLink } from "../services/registration.service.js";
+import { syncFullListsToTerminal } from "../services/sync.service.js";
  
 import logger from "../config/logger.js";
 import type { Logger } from "pino";
-import { prisma } from "../services/ledger.service.js";
 import { publishToTerminal } from "./downlinkQueue.js";
 import {
   handleDriverRegister,
@@ -106,7 +106,7 @@ async function routeUplinkMessage(
     }
 
     case PAYLOAD_TYPE.SYS_FULL_SYNC:
-      await handleFullSyncRequest(terminalId, log);
+      await syncFullListsToTerminal(terminalId);
       break;
 
     case PAYLOAD_TYPE.DRIVER_EVENT: {
@@ -142,95 +142,95 @@ async function routeUplinkMessage(
   }
 }
 
-async function handleFullSyncRequest(
-  terminalId: string,
-  log: ChildLogger
-): Promise<void> {
-  log.info("uplink.full_sync_requested");
+// async function handleFullSyncRequest(
+//   terminalId: string,
+//   log: ChildLogger
+// ): Promise<void> {
+//   log.info("uplink.full_sync_requested");
 
-  const MAX_CHUNK_BYTES = 500;
-  const SYNC_DELAY_MS = 2000;
-  const sleep = (ms: number) =>
-    new Promise((resolve) => setTimeout(resolve, ms));
+//   const MAX_CHUNK_BYTES = 500;
+//   const SYNC_DELAY_MS = 2000;
+//   const sleep = (ms: number) =>
+//     new Promise((resolve) => setTimeout(resolve, ms));
 
-  try {
-    // Fetch whitelist — all linked wallets
-    const cardMappings = await prisma.cardMapping.findMany({
-      select: { card_uid: true },
-    });
+//   try {
+//     // Fetch whitelist — all linked wallets
+//     const cardMappings = await prisma.cardMapping.findMany({
+//       select: { card_uid: true },
+//     });
 
-    const whitelistUids = cardMappings.map(
-      (c: { card_uid: string }) => c.card_uid
-    );
+//     const whitelistUids = cardMappings.map(
+//       (c: { card_uid: string }) => c.card_uid
+//     );
 
-    // Fetch blacklist — all blacklisted wallets
-    const blacklistedMappings = await prisma.cardMapping.findMany({
-      where: {
-        student_uid: {
-          in: await prisma.blacklist
-            .findMany({ select: { student_uid: true } })
-            .then((bl: { student_uid: string }[]) =>
-              bl.map((b: { student_uid: string }) => b.student_uid)
-            ),
-        },
-      },
-      select: { card_uid: true },
-    });
+//     // Fetch blacklist — all blacklisted wallets
+//     const blacklistedMappings = await prisma.cardMapping.findMany({
+//       where: {
+//         student_uid: {
+//           in: await prisma.blacklist
+//             .findMany({ select: { student_uid: true } })
+//             .then((bl: { student_uid: string }[]) =>
+//               bl.map((b: { student_uid: string }) => b.student_uid)
+//             ),
+//         },
+//       },
+//       select: { card_uid: true },
+//     });
 
-    const blacklistUids = blacklistedMappings.map(
-      (c: { card_uid: string }) => c.card_uid
-    );
+//     const blacklistUids = blacklistedMappings.map(
+//       (c: { card_uid: string }) => c.card_uid
+//     );
 
-    log.info(
-      {
-        whitelistCount: whitelistUids.length,
-        blacklistCount: blacklistUids.length,
-      },
-      "uplink.full_sync_data_fetched"
-    );
+//     log.info(
+//       {
+//         whitelistCount: whitelistUids.length,
+//         blacklistCount: blacklistUids.length,
+//       },
+//       "uplink.full_sync_data_fetched"
+//     );
 
-    // Publish Whitelist
-    if (whitelistUids.length === 0) {
-      await publishToTerminal(terminalId, "SYS:WL,EMPTY");
-    } else {
-      const wlChunks = buildChunks("SYS:WL,", whitelistUids, MAX_CHUNK_BYTES);
-      for (let i = 0; i < wlChunks.length; i++) {
-        await publishToTerminal(terminalId, wlChunks[i]);
-        log.debug(
-          { chunk: i + 1, total: wlChunks.length },
-          "uplink.wl_chunk_sent"
-        );
-        if (i < wlChunks.length - 1) await sleep(SYNC_DELAY_MS);
-      }
-    }
+//     // Publish Whitelist
+//     if (whitelistUids.length === 0) {
+//       await publishToTerminal(terminalId, "SYS:WL,EMPTY");
+//     } else {
+//       const wlChunks = buildChunks("SYS:WL,", whitelistUids, MAX_CHUNK_BYTES);
+//       for (let i = 0; i < wlChunks.length; i++) {
+//         await publishToTerminal(terminalId, wlChunks[i]);
+//         log.debug(
+//           { chunk: i + 1, total: wlChunks.length },
+//           "uplink.wl_chunk_sent"
+//         );
+//         if (i < wlChunks.length - 1) await sleep(SYNC_DELAY_MS);
+//       }
+//     }
 
-    await sleep(SYNC_DELAY_MS);
+//     await sleep(SYNC_DELAY_MS);
 
-    // Publish Blacklist
-    if (blacklistUids.length === 0) {
-      await publishToTerminal(terminalId, "SYS:BL,EMPTY");
-    } else {
-      const blChunks = buildChunks("SYS:BL,", blacklistUids, MAX_CHUNK_BYTES);
-      for (let i = 0; i < blChunks.length; i++) {
-        await publishToTerminal(terminalId, blChunks[i]);
-        log.debug(
-          { chunk: i + 1, total: blChunks.length },
-          "uplink.bl_chunk_sent"
-        );
-        if (i < blChunks.length - 1) await sleep(SYNC_DELAY_MS);
-      }
-    }
+//     // Publish Blacklist
+//     if (blacklistUids.length === 0) {
+//       await publishToTerminal(terminalId, "SYS:BL,EMPTY");
+//     } else {
+//       const blChunks = buildChunks("SYS:BL,", blacklistUids, MAX_CHUNK_BYTES);
+//       for (let i = 0; i < blChunks.length; i++) {
+//         await publishToTerminal(terminalId, blChunks[i]);
+//         log.debug(
+//           { chunk: i + 1, total: blChunks.length },
+//           "uplink.bl_chunk_sent"
+//         );
+//         if (i < blChunks.length - 1) await sleep(SYNC_DELAY_MS);
+//       }
+//     }
 
-    await sleep(SYNC_DELAY_MS);
+//     await sleep(SYNC_DELAY_MS);
 
-    await publishToTerminal(terminalId, "SYS:SYNC_COMPLETE");
-    log.info("uplink.full_sync_complete");
-  } catch (error) {
-    const errMessage = error instanceof Error ? error.message : "Unknown error";
-    log.error({ err: errMessage }, "uplink.full_sync_error");
-    throw error;
-  }
-}
+//     await publishToTerminal(terminalId, "SYS:SYNC_COMPLETE");
+//     log.info("uplink.full_sync_complete");
+//   } catch (error) {
+//     const errMessage = error instanceof Error ? error.message : "Unknown error";
+//     log.error({ err: errMessage }, "uplink.full_sync_error");
+//     throw error;
+//   }
+// }
 
 async function handleDriverEvent(
   terminalId: string,
@@ -273,34 +273,6 @@ async function handleDriverRegisterEvent(
       "uplink.driver_register_failed"
     );
   }
-}
-
-function buildChunks(
-  prefix: string,
-  uids: string[],
-  maxBytes: number
-): string[] {
-  const chunks: string[] = [];
-  let currentChunk: string[] = [];
-  let currentSize = prefix.length;
-
-  for (const uid of uids) {
-    const segment = currentChunk.length === 0 ? uid : `|${uid}`;
-    if (currentSize + segment.length > maxBytes) {
-      chunks.push(`${prefix}${currentChunk.join("|")}`);
-      currentChunk = [uid];
-      currentSize = prefix.length + uid.length;
-    } else {
-      currentChunk.push(uid);
-      currentSize += segment.length;
-    }
-  }
-
-  if (currentChunk.length > 0) {
-    chunks.push(`${prefix}${currentChunk.join("|")}`);
-  }
-
-  return chunks;
 }
 
 export { routeUplinkMessage };
