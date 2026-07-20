@@ -11,6 +11,7 @@ import {
 import { ingestTransactionBatch } from "../services/ingestion.service.js";
 import { handlePendingLink } from "../services/registration.service.js";
 import { syncFullListsToTerminal } from "../services/sync.service.js";
+import { handleLwtEvent } from "../mqtt/lwtHandler.js";
  
 import logger from "../config/logger.js";
 import type { Logger } from "pino";
@@ -56,7 +57,7 @@ async function routeUplinkMessage(
   // broker on behalf of the terminal — they cannot be HMAC-signed.
   // These are safe to process unsigned: they only update terminal status
   // in DB and flush the Redis queue — no financial logic runs here.
-  /*if (topic.endsWith("/status")) {
+  if (topic.endsWith("/status")) {
     await handleLwtEvent(terminalId, rawMessage);
     return;
   }
@@ -65,7 +66,7 @@ async function routeUplinkMessage(
     log.warn("uplink.unexpected_topic_suffix — discarding");
     return;
   }
-*/
+
   // ── HMAC verification gate ────────────────────────────────────────────
   // All /tx messages must be signed. verifyAndUnwrap returns the raw
   // payload with the HMAC wrapper stripped, or null on any failure.
