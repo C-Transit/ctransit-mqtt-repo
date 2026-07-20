@@ -24,7 +24,14 @@ app.use(morgan("dev"));
 app.use(express.json());
 app.use(cors());
 
+// ── Health & root routes ──
 app.use("/health", healthRouter);
+
+// Quick root route for Render health checks
+app.get("/", (_req, res) => {
+  res.status(200).json({ status: "ok", service: "ctransit-mqtt" });
+});
+
 app.use("/internal", internalRouter);
 
 app.use((_req, res) => {
