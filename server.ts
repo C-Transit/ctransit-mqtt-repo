@@ -33,12 +33,14 @@ app.use((_req, res) => {
 
 const server = http.createServer(app);
 let isShuttingDown = false;
+let keepAliveInterval: NodeJS.Timeout | null = null;
 
 async function boot(): Promise<void> {
   logger.info({ env: env.NODE_ENV }, "mqtt_service.boot_start");
 
   try {
     const redis = getRedisClient();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (redis as any).ping();
     logger.info("mqtt_service.redis_ready");
   } catch (err) {
@@ -73,6 +75,16 @@ async function boot(): Promise<void> {
     logger.info({ port: env.PORT }, "mqtt_service.http_listening");
   });
 
+  // ── Start DB keep‑alive ping every 30 seconds ──
+  keepAliveInterval = setInterval(async () => {
+    try {
+      await prisma.$queryRaw`SELECT 1`;
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : "Unknown error";
+      logger.warn({ err: errMsg }, "mqtt_service.db_keepalive_failed");
+    }
+  }, 30000);
+
   logger.info("mqtt_service.boot_complete");
 }
 
@@ -81,6 +93,12 @@ async function shutdown(signal: string): Promise<void> {
   isShuttingDown = true;
 
   logger.info({ signal }, "mqtt_service.shutdown_initiated");
+
+  // Clear keep‑alive interval
+  if (keepAliveInterval) {
+    clearInterval(keepAliveInterval);
+    keepAliveInterval = null;
+  }
 
   stopBroadcastConsumer();
   server.close();
@@ -95,6 +113,7 @@ async function shutdown(signal: string): Promise<void> {
 
   try {
     const redis = getRedisClient();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (redis as any).quit();
     logger.info("mqtt_service.redis_disconnected");
   } catch (err) {
