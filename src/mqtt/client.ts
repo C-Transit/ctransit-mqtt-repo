@@ -20,7 +20,10 @@ function connectMqtt(): Promise<any> {
       ...mqttConfig.options,
     });
 
+    let settled = false;
+
     client.on("connect", (connack: IConnackPacket) => {
+      settled = true;
       logger.info({ sessionPresent: connack.sessionPresent }, "mqtt.connected");
 
       if (client) {
@@ -64,7 +67,10 @@ function connectMqtt(): Promise<any> {
 
     client.on("error", (err: Error) => {
       logger.error({ err: err.message }, "mqtt.error");
-      if (client && !client.connected) reject(err);
+      if (!settled) {
+        settled = true;
+        reject(err);
+      }
     });
 
     client.on("reconnect", () => logger.warn("mqtt.reconnecting"));

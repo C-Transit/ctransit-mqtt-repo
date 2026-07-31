@@ -47,6 +47,7 @@ async function boot(): Promise<void> {
 
   try {
     const redis = getRedisClient();
+    
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (redis as any).ping();
     logger.info("mqtt_service.redis_ready");

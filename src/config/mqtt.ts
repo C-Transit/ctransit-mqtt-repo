@@ -1,7 +1,6 @@
 import type { IClientOptions } from "mqtt";
 import env from "./env.js";
 
-// Define a strict interface for your MQTT setup
 interface MqttConfig {
   brokerUrl: string;
   options: IClientOptions;
@@ -20,9 +19,10 @@ const mqttConfig: MqttConfig = {
   brokerUrl: `mqtts://${env.mqtt.host}:${env.mqtt.port}`,
 
   options: {
-    clientId: `${env.mqtt.clientId}_${Math.random()
-      .toString(16)
-      .substring(2, 6)}`,
+    // Stable clientId — must not change between restarts.
+    // Random suffix breaks clean:false session persistence
+    // because HiveMQ treats each unique clientId as a new client.
+    clientId: env.mqtt.clientId,
     username: env.mqtt.username,
     password: env.mqtt.password,
     protocol: "mqtts",
@@ -31,7 +31,10 @@ const mqttConfig: MqttConfig = {
     keepalive: 60,
     connectTimeout: 30 * 1000,
     reconnectPeriod: 5000,
-    clean: true,
+    // clean: false — preserve session across restarts.
+    // HiveMQ queues QoS 1 messages while service is offline
+    // and delivers them in order on reconnect.
+    clean: false,
     will: {
       topic: "ctransit/server/status",
       payload: "OFFLINE",
