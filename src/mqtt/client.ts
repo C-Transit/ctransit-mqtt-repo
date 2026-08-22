@@ -22,7 +22,16 @@ function connectMqtt(): Promise<any> {
 
     let settled = false;
 
+    const timeoutTimer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        logger.warn("mqtt.connect_timeout — continuing in background");
+        resolve(client);
+      }
+    }, 4000);
+
     client.on("connect", (connack: IConnackPacket) => {
+      clearTimeout(timeoutTimer);
       settled = true;
       logger.info({ sessionPresent: connack.sessionPresent }, "mqtt.connected");
 

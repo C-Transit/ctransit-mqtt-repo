@@ -9,10 +9,6 @@ import morgan from "morgan";
 import { connectMqtt, disconnectMqtt } from "./src/mqtt/client.js";
 import { getRedisClient } from "./src/config/redis.js";
 import { prisma } from "./src/services/ledger.service.js";
-import {
-  startBroadcastConsumer,
-  stopBroadcastConsumer,
-} from "./src/consumer/broadcast.consumer.js";
 import healthRouter from "./src/routes/health.routes.js";
 import internalRouter from "./src/routes/internal.routes.js";
 import logger from "./src/config/logger.js";
@@ -45,26 +41,39 @@ let keepAliveInterval: NodeJS.Timeout | null = null;
 async function boot(): Promise<void> {
   logger.info({ env: env.NODE_ENV }, "mqtt_service.boot_start");
 
+  server.listen(env.PORT, () => {
+    logger.info({ port: env.PORT }, "mqtt_service.http_listening");
+  });
+
   try {
     const redis = getRedisClient();
-    
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (redis as any).ping();
     logger.info("mqtt_service.redis_ready");
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
-    logger.fatal({ err: errMsg }, "mqtt_service.redis_failed — aborting");
-    process.exit(1);
+    if (env.NODE_ENV === "production") {
+      logger.fatal({ err: errMsg }, "mqtt_service.redis_failed — aborting");
+      process.exit(1);
+    } else {
+      logger.warn({ err: errMsg }, "mqtt_service.redis_unavailable — continuing in dev mode");
+    }
   }
 
+  let pgConnected = false;
   try {
     await prisma.$connect();
     await prisma.$queryRaw`SELECT 1`;
+    pgConnected = true;
     logger.info("mqtt_service.postgres_ready");
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
-    logger.fatal({ err: errMsg }, "mqtt_service.postgres_failed — aborting");
-    process.exit(1);
+    if (env.NODE_ENV === "production") {
+      logger.fatal({ err: errMsg }, "mqtt_service.postgres_failed — aborting");
+      process.exit(1);
+    } else {
+      logger.warn({ err: errMsg }, "mqtt_service.postgres_unavailable — continuing in dev mode");
+    }
   }
 
   try {
@@ -72,26 +81,25 @@ async function boot(): Promise<void> {
     logger.info("mqtt_service.mqtt_ready");
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
-    logger.fatal({ err: errMsg }, "mqtt_service.mqtt_failed — aborting");
-    process.exit(1);
+    if (env.NODE_ENV === "production") {
+      logger.fatal({ err: errMsg }, "mqtt_service.mqtt_failed — aborting");
+      process.exit(1);
+    } else {
+      logger.warn({ err: errMsg }, "mqtt_service.mqtt_unavailable — continuing in dev mode");
+    }
   }
 
-  await startBroadcastConsumer();
-  logger.info("mqtt_service.broadcast_consumer_ready");
-
-  server.listen(env.PORT, () => {
-    logger.info({ port: env.PORT }, "mqtt_service.http_listening");
-  });
-
-  // ── Start DB keep‑alive ping every 30 seconds ──
-  keepAliveInterval = setInterval(async () => {
-    try {
-      await prisma.$queryRaw`SELECT 1`;
-    } catch (err) {
-      const errMsg = err instanceof Error ? err.message : "Unknown error";
-      logger.warn({ err: errMsg }, "mqtt_service.db_keepalive_failed");
-    }
-  }, 30000);
+  // ── Start DB keep‑alive ping every 30 seconds only if connected ──
+  if (pgConnected) {
+    keepAliveInterval = setInterval(async () => {
+      try {
+        await prisma.$queryRaw`SELECT 1`;
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : "Unknown error";
+        logger.warn({ err: errMsg }, "mqtt_service.db_keepalive_failed");
+      }
+    }, 30000);
+  }
 
   logger.info("mqtt_service.boot_complete");
 }
@@ -108,7 +116,6 @@ async function shutdown(signal: string): Promise<void> {
     keepAliveInterval = null;
   }
 
-  stopBroadcastConsumer();
   server.close();
 
   try {

@@ -20,7 +20,7 @@ router.post("/test-sync/:terminalId", validateApiKey, async (req, res) => {
   await syncFullListsToTerminal(terminalId);
   res.json({ success: true });
 });
-router.post("/test-deduct", testDeduct);
+router.post("/test-deduct", validateApiKey, testDeduct);
 router.post("/test-remove-blacklist", validateApiKey, testBlacklistRemoval);
 
 

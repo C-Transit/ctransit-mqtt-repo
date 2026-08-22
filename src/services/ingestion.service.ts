@@ -15,10 +15,11 @@ import { getRedisClient, cacheKeys } from "../config/redis.js";
 
 type LoggerInstance = typeof logger;
 
+const CARD_CACHE_TTL_SECONDS = 604800; // 7 days TTL
+
 // ── Cache Helper: Card Mapping ────────────────────────────────────────────────
-// This is the ONLY remaining Redis cache in the MQTT service.
-// Card mappings are permanent and change rarely — Redis is justified here.
-// Wallet and blacklist caches have been removed — direct DB queries instead.
+// Maps hardware card UID → student matricNumber in Redis with a 7-day TTL.
+// Invalidated on card re-link in registration.service.ts.
 async function resolveCardUid(cardUid: string): Promise<string | null> {
   const redis = getRedisClient();
   const key = cacheKeys.cardMap(cardUid);
@@ -33,8 +34,8 @@ async function resolveCardUid(cardUid: string): Promise<string | null> {
 
   if (!mapping) return null;
 
-  // No TTL — permanent until card is re-linked
-  await redis.set(key, mapping.student_uid);
+  // Cache with 7-day TTL
+  await redis.set(key, mapping.student_uid, "EX", CARD_CACHE_TTL_SECONDS);
 
   return mapping.student_uid;
 }
@@ -59,8 +60,15 @@ async function ingestTransactionBatch(
     return;
   }
 
+  // Optimize: query terminal active driver once per batch instead of per transaction
+  const terminal = await prisma.terminal.findUnique({
+    where: { terminal_id: terminalId },
+    select: { active_driver_uid: true },
+  });
+  const defaultDriverUid = terminal?.active_driver_uid || null;
+
   for (const tx of valid) {
-    await processTransaction(tx, terminalId, log);
+    await processTransaction(tx, terminalId, defaultDriverUid, log);
   }
 
   log.info({ processedCount: valid.length }, "ingestion.batch_complete");
@@ -69,6 +77,7 @@ async function ingestTransactionBatch(
 async function processTransaction(
   tx: ParsedTransaction,
   terminalId: string,
+  defaultDriverUid: string | null,
   log: LoggerInstance
 ): Promise<void> {
   const txLog = log.child({
@@ -77,7 +86,7 @@ async function processTransaction(
   });
 
   try {
-    // ── STEP 0: Resolve card UID → matricNumber (Redis cached) ────────────
+    // ── STEP 0: Resolve card UID → matricNumber (Redis cached with TTL) ───
     const matricNumber = await resolveCardUid(tx.student_uid);
 
     if (!matricNumber) {
@@ -91,11 +100,17 @@ async function processTransaction(
 
     txLog.info({ matricNumber }, "ingestion.card_uid_resolved");
 
-    // ── CHECK 1: Is student whitelisted? (direct DB) ──────────────────────
-    const wallet = await prisma.wallet.findUnique({
-      where: { student_uid: matricNumber },
-      select: { balance: true, is_linked: true },
-    });
+    // ── STEP 1 & 2: Check wallet whitelist and blacklist in parallel ──────
+    const [wallet, blacklisted] = await Promise.all([
+      prisma.wallet.findUnique({
+        where: { student_uid: matricNumber },
+        select: { balance: true, is_linked: true },
+      }),
+      prisma.blacklist.findUnique({
+        where: { student_uid: matricNumber },
+        select: { student_uid: true },
+      }),
+    ]);
 
     const walletData = wallet
       ? {
@@ -113,14 +128,7 @@ async function processTransaction(
       return;
     }
 
-    // ── CHECK 2: Is student blacklisted? (direct DB) ──────────────────────
-    const blacklisted = await prisma.blacklist.findUnique({
-      where: { student_uid: matricNumber },
-      select: { student_uid: true },
-    });
-    const isBlacklisted = !!blacklisted;
-
-    if (isBlacklisted) {
+    if (blacklisted) {
       txLog.warn({ matricNumber }, "ingestion.student_is_blacklisted");
       await publishToTerminal(
         terminalId,
@@ -129,28 +137,10 @@ async function processTransaction(
       return;
     }
 
-    // ─── CHECK 3 DISABLED (balance check) ────────────────────────────────
-    // Restore this block when payment API is live:
-    //
-    // if (walletData.balance < tx.amount) {
-    //   txLog.warn({ balance: walletData.balance, required: tx.amount }, "ingestion.insufficient_balance");
-    //   await publishToTerminal(terminalId, `ACK:FAIL,${tx.student_uid},INSUFFICIENT_FUNDS`);
-    //   await prisma.blacklist.upsert({ ... });
-    //   await broadcastDeltaToFleet(buildDeltaCommand("ADD", "BL", tx.student_uid));
-    //   return;
-    // }
-    // ─────────────────────────────────────────────────────────────────────
-
     const currentBalance = walletData.balance;
+    const driverUid = tx.driver_uid || defaultDriverUid;
 
-    const terminal = await prisma.terminal.findUnique({
-      where: { terminal_id: terminalId },
-      select: { active_driver_uid: true },
-    });
-
-    const driverUid = tx.driver_uid || terminal?.active_driver_uid || null;
-
-    // ── All checks passed — deduct atomically ─────────────────────────────
+    // ── All checks passed — deduct atomically with idempotency ─────────────
     const result = await prisma.$transaction(
       async (tx_ctx: Prisma.TransactionClient) => {
         const existingTx = await tx_ctx.transaction.findUnique({

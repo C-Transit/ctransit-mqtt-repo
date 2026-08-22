@@ -33,7 +33,7 @@ function publishToTerminal(terminalId: string, command: string): Promise<void> {
           log.error({ err: err.message }, "downlink.publish_error");
           return reject(err);
         }
-        log.info("downlink.published");
+        log.debug("downlink.published");
         resolve();
       }
     );

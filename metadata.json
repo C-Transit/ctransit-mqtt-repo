@@ -1,0 +1,5 @@
+{
+  "name": "CTransit MQTT Service",
+  "description": "CTransit MQTT terminal communication layer and microservice",
+  "requestFramePermissions": []
+}

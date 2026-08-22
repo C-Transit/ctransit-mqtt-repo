@@ -6,8 +6,8 @@
   "scripts": {
     "postinstall": "prisma generate",
     "build": "tsc",
-    "start": "node dist/server.js",
-    "dev": "tsx watch server.ts",
+    "start": "node server.ts",
+    "dev": "tsx server.ts",
     "lint": "eslint src --ext .ts,.tsx"
   },
   "keywords": [],
