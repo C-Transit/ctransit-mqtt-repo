@@ -2,6 +2,7 @@ import mqtt from "mqtt";
 import type { IConnackPacket, Packet } from "mqtt";
 import mqttConfig from "../config/mqtt.js";
 import logger from "../config/logger.js";
+import env from "../config/env.js";
 import { routeUplinkMessage } from "./uplinkRouter.js";
 import { injectClient, publishToTerminal } from "./downlinkQueue.js";
 import { injectMqttPublisher } from "../services/sync.service.js";
@@ -12,9 +13,13 @@ let client: any = null;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function connectMqtt(): Promise<any> {
   return new Promise((resolve, reject) => {
-    logger.info(
-      "mqtt.connecting"
-    );
+    if (!env.mqtt.host) {
+      const err = new Error("MQTT broker host is not configured. Set HIVEMQ_CLUSTER_URL before starting the service.");
+      logger.error({ host: env.mqtt.host }, "mqtt.missing_broker_host");
+      return reject(err);
+    }
+
+    logger.info({ brokerUrl: mqttConfig.brokerUrl }, "mqtt.connecting");
 
     client = mqtt.connect(mqttConfig.brokerUrl, {
       ...mqttConfig.options,

@@ -8,24 +8,26 @@ import cors from "cors";
 import morgan from "morgan";
 import { connectMqtt, disconnectMqtt } from "./src/mqtt/client.js";
 import { getRedisClient } from "./src/config/redis.js";
-import { prisma } from "./src/services/ledger.service.js";
+import { prisma } from "./src/lib/prisma.js";
 import healthRouter from "./src/routes/health.routes.js";
 import internalRouter from "./src/routes/internal.routes.js";
 import logger from "./src/config/logger.js";
 import env from "./src/config/env.js";
 
 const app = express();
+const port = env.PORT;
+const morganFormat = env.NODE_ENV === "production" ? "combined" : "dev";
 
-app.use(morgan("dev"));
+app.use(morgan(morganFormat));
 app.use(express.json());
 app.use(cors());
 
-// ── Health & root routes ──
+// Health route
 app.use("/health", healthRouter);
 
 // Quick root route for Render health checks
 app.get("/", (_req, res) => {
-  res.status(200).json({ status: "ok", service: "ctransit-mqtt" });
+  res.status(200).json({ status: "ok", service: env.NODE_ENV === "production" ? "ctransit-mqtt" : "ctransit-mqtt-dev" });
 });
 
 app.use("/internal", internalRouter);
@@ -35,14 +37,15 @@ app.use((_req, res) => {
 });
 
 const server = http.createServer(app);
+
 let isShuttingDown = false;
 let keepAliveInterval: NodeJS.Timeout | null = null;
 
 async function boot(): Promise<void> {
   logger.info({ env: env.NODE_ENV }, "mqtt_service.boot_start");
 
-  server.listen(env.PORT, () => {
-    logger.info({ port: env.PORT }, "mqtt_service.http_listening");
+  server.listen(port, () => {
+    logger.info({ port }, "mqtt_service.http_listening");
   });
 
   try {

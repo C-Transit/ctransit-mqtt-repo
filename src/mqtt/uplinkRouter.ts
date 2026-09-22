@@ -1,13 +1,15 @@
 import {
   PAYLOAD_TYPE,
   detectPayloadType,
+  splitBatchPayload,
   parsePendingLink,
+  parseSyncRequest,
   parseDriverRegister,
   parseDriverEvent,
   type DriverEventData,
   type DriverRegisterData,
+  type SyncRequestData,
 } from "../utils/parser.js";
-// uplinkRouter.ts — add import at top
 import { ingestTransactionBatch } from "../services/ingestion.service.js";
 import { handlePendingLink } from "../services/registration.service.js";
 import { syncFullListsToTerminal } from "../services/sync.service.js";
@@ -22,7 +24,6 @@ import {
   handleDriverLogout,
 } from "../services/driver.service.js";
 
-// Type definition matching your pino child log structure
 type ChildLogger = Logger;
 
 function extractTerminalId(topic: string): string | null {
@@ -37,8 +38,6 @@ function extractTerminalId(topic: string): string | null {
   return id;
 }
 
-// uplinkRouter.ts — replace routeUplinkMessage function only
-
 async function routeUplinkMessage(
   topic: string,
   payloadBuffer: Buffer
@@ -52,11 +51,7 @@ async function routeUplinkMessage(
   const log = logger.child({ terminalId, topic });
   const rawMessage = payloadBuffer.toString("utf8").trim();
 
-  // ── Status messages bypass HMAC ───────────────────────────────────────
-  // LWT and status payloads ("ONLINE" / "OFFLINE") are published by the
-  // broker on behalf of the terminal — they cannot be HMAC-signed.
-  // These are safe to process unsigned: they only update terminal status
-  // in DB and flush the Redis queue — no financial logic runs here.
+// Very Important: Handle LWT messages first, before any other processing
   if (topic.endsWith("/status")) {
     await handleLwtEvent(terminalId, rawMessage);
     return;
@@ -67,80 +62,106 @@ async function routeUplinkMessage(
     return;
   }
 
-  // ── HMAC verification gate ────────────────────────────────────────────
-  // All /tx messages must be signed. verifyAndUnwrap returns the raw
-  // payload with the HMAC wrapper stripped, or null on any failure.
-  // Failures are logged inside verifyAndUnwrap — no need to log here.
-  /*const payload = await verifyAndUnwrap(terminalId, rawMessage);
-  if (!payload) {
-    // verifyAndUnwrap already logged the reason — just discard silently
-    return;
-  }
-*/
+  // Very Important: Split the batch payload into individual lines, and process each line
+  const { deviceId, lines } = splitBatchPayload(rawMessage, terminalId);
+  const activeTerminalId = deviceId || terminalId;
 
-  const prefix = `${terminalId}:`;
-  const payload = rawMessage.startsWith(prefix)
-    ? rawMessage.substring(prefix.length)
-    : rawMessage;
-
-  const payloadType = detectPayloadType(payload);
   log.debug(
-    { payloadType, payloadLength: payload.length },
-    "uplink.message_received"
+    { messageCount: lines.length, activeTerminalId },
+    "uplink.batch_split_complete"
   );
 
-  switch (payloadType) {
-    case PAYLOAD_TYPE.TRANSACTION_BATCH:
-      await ingestTransactionBatch(terminalId, payload);
-      break;
+  for (const line of lines) {
+    const payloadType = detectPayloadType(line);
+    log.debug(
+      { payloadType, lineLength: line.length },
+      "uplink.message_received"
+    );
 
-    case PAYLOAD_TYPE.PENDING_LINK: {
-      const { data, error } = parsePendingLink(payload);
-      if (error) {
-        log.warn({ error }, "uplink.pending_link_parse_error — discarding");
-        return;
+    switch (payloadType) {
+      case PAYLOAD_TYPE.TRANSACTION_BATCH:
+        await ingestTransactionBatch(activeTerminalId, line);
+        break;
+
+      case PAYLOAD_TYPE.PENDING_LINK: {
+        const { data, error } = parsePendingLink(line, activeTerminalId);
+        if (error) {
+          log.warn({ error, line }, "uplink.pending_link_parse_error — discarding");
+          break;
+        }
+        if (data) {
+          await handlePendingLink(activeTerminalId, data);
+        }
+        break;
       }
-      if (data) {
-        await handlePendingLink(terminalId, data);
+
+      case PAYLOAD_TYPE.SYNC_REQUEST: {
+        const { data, error } = parseSyncRequest(line, activeTerminalId);
+        if (error) {
+          log.warn({ error, line }, "uplink.sync_request_parse_error — discarding");
+          break;
+        }
+        if (data) {
+          await handleSyncRequest(activeTerminalId, data, log);
+        }
+        break;
       }
-      break;
+
+      case PAYLOAD_TYPE.SYS_FULL_SYNC:
+        await syncFullListsToTerminal(activeTerminalId);
+        break;
+
+      case PAYLOAD_TYPE.DRIVER_EVENT: {
+        const { data, error } = parseDriverEvent(line);
+        if (error) {
+          log.warn({ error, line }, "uplink.driver_event_parse_error — discarding");
+          break;
+        }
+        if (data) {
+          await handleDriverEvent(activeTerminalId, data, log);
+        }
+        break;
+      }
+
+      case PAYLOAD_TYPE.DRIVER_REGISTER: {
+        const { data, error } = parseDriverRegister(line);
+        if (error) {
+          log.warn({ error, line }, "uplink.driver_register_parse_error — discarding");
+          break;
+        }
+        if (data) {
+          await handleDriverRegisterEvent(activeTerminalId, data, log);
+        }
+        break;
+      }
+
+      default:
+        log.warn(
+          { rawPayload: line.substring(0, 80) },
+          "uplink.unknown_payload_type"
+        );
+        break;
     }
-
-    case PAYLOAD_TYPE.SYS_FULL_SYNC:
-      await syncFullListsToTerminal(terminalId);
-      break;
-
-    case PAYLOAD_TYPE.DRIVER_EVENT: {
-      const { data, error } = parseDriverEvent(payload);
-      if (error) {
-        log.warn({ error }, "uplink.driver_event_parse_error — discarding");
-        return;
-      }
-      if (data) {
-        await handleDriverEvent(terminalId, data, log);
-      }
-      break;
-    }
-
-    case PAYLOAD_TYPE.DRIVER_REGISTER: {
-      const { data, error } = parseDriverRegister(payload);
-      if (error) {
-        log.warn({ error }, "uplink.driver_register_parse_error — discarding");
-        return;
-      }
-      if (data) {
-        await handleDriverRegisterEvent(terminalId, data, log);
-      }
-      break;
-    }
-
-    default:
-      log.warn(
-        { rawPayload: payload.substring(0, 80) },
-        "uplink.unknown_payload_type"
-      );
-      break;
   }
+}
+
+// Very Important: Handle Sync Request messages by triggering a full sync to the terminal
+async function handleSyncRequest(
+  terminalId: string,
+  data: SyncRequestData,
+  log: ChildLogger
+): Promise<void> {
+  const targetTerminalId = data.device_id || terminalId;
+  log.info(
+    {
+      terminalId: targetTerminalId,
+      timestamp: data.timestamp,
+      driver_uid: data.driver_uid,
+      location: data.location,
+    },
+    "uplink.sync_request_received"
+  );
+  await syncFullListsToTerminal(targetTerminalId);
 }
 
 // async function handleFullSyncRequest(

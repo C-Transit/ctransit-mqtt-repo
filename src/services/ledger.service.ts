@@ -1,5 +1,6 @@
 "use strict";
 
+import crypto from "node:crypto";
 import prisma from "../lib/prisma.js";
 import type { Prisma } from "@prisma/client";
 import logger from "../config/logger.js";
@@ -102,8 +103,446 @@ async function creditWallet(
   return { previousBalance, newBalance };
 }
 
+export interface SettleRideParams {
+  transactionId?: string;
+  terminalId: string;
+  studentUid: string;
+  cardUid?: string;
+  rawAmount?: number;
+  amount: number;
+  timestamp?: number;
+  driverUid: string | null;
+  location?: string | null;
+  protocolVersion?: string;
+  syncedAt?: Date;
+}
+
+export type SettlementStatus =
+  | "SUCCESS"
+  | "DUPLICATE"
+  | "INSUFFICIENT_BALANCE"
+  | "NOT_WHITELISTED"
+  | "BLACKLISTED"
+  | "CARD_NOT_REGISTERED"
+  | "DRIVER_MISMATCH"
+  | "NOT_FOUND";
+
+export interface SettleRideResult {
+  status: SettlementStatus;
+  newBalance: number | null;
+  fare: number;
+  driverAmount?: number;
+  cTransitAmount?: number;
+  transactionId?: string;
+  belowThreshold?: boolean;
+}
+
+// Fingerprinting backend security link
+export function computeDeterministicFingerprint(params: {
+  protocolVersion?: string;
+  terminalId: string;
+  cardUid: string;
+  rawAmount: number;
+  timestamp: number;
+  driverUid: string | null;
+  location: string;
+}): string {
+  const proto = params.protocolVersion || "v1.1.0L";
+  const drv = params.driverUid || "";
+  const input = `${proto}${params.terminalId}${params.cardUid}${params.rawAmount}${params.timestamp}${drv}${params.location}`;
+  return crypto.createHash("sha256").update(input).digest("hex");
+}
+
+async function settleRideTransaction(
+  params: SettleRideParams,
+  dbClient: DbClient = prisma
+): Promise<SettleRideResult> {
+  const {
+    transactionId,
+    terminalId,
+    studentUid,
+    cardUid,
+    rawAmount,
+    amount,
+    timestamp,
+    driverUid,
+    location,
+    protocolVersion,
+    syncedAt,
+  } = params;
+
+  const effectiveCardUid = cardUid || studentUid;
+  const isV110L = protocolVersion === "v1.1.0L" || Boolean(location);
+
+  // Determine deterministic transactionId
+  let txId: string;
+  if (location) {
+    const proto = protocolVersion || "v1.1.0L";
+    const rawAmt = rawAmount !== undefined ? rawAmount : -Math.abs(amount);
+    const ts =
+      timestamp !== undefined
+        ? timestamp
+        : Math.floor((syncedAt?.getTime() ?? Date.now()) / 1000);
+    txId = computeDeterministicFingerprint({
+      protocolVersion: proto,
+      terminalId,
+      cardUid: effectiveCardUid,
+      rawAmount: rawAmt,
+      timestamp: ts,
+      driverUid: driverUid || null,
+      location,
+    });
+  } else {
+
+    // Legacy fallback format
+    const ts =
+      timestamp !== undefined
+        ? timestamp
+        : Math.floor((syncedAt?.getTime() ?? Date.now()) / 1000);
+    txId = transactionId || `${terminalId}-${ts}-${effectiveCardUid}`;
+  }
+
+  const childLogger = logger.child({
+    transactionId: txId,
+    cardUid: effectiveCardUid,
+    amount,
+    driverUid,
+    terminalId,
+    location,
+  });
+
+  const execute = async (tx_ctx: Prisma.TransactionClient) => {
+
+    // 1. Idempotency Check
+    const existingTx = await tx_ctx.transaction.findUnique({
+      where: { transaction_id: txId },
+    });
+
+    if (existingTx) {
+      childLogger.info(
+        { transactionId: txId },
+        "ledger.settle_ride_duplicate_detected"
+      );
+
+      // Resolve card UID to check current balance for idempotent ACK
+      const mapping = await tx_ctx.cardMapping.findUnique({
+        where: { card_uid: effectiveCardUid },
+        select: { student_uid: true },
+      });
+      const resolvedMatric = mapping ? mapping.student_uid : effectiveCardUid;
+      const currentWallet = await tx_ctx.wallet.findUnique({
+        where: { student_uid: resolvedMatric },
+        select: { balance: true },
+      });
+      const currentBalance = currentWallet
+        ? parseFloat(currentWallet.balance.toString())
+        : 0;
+      return {
+        status: "DUPLICATE" as const,
+        newBalance: currentBalance,
+        fare: amount,
+        transactionId: txId,
+      };
+    }
+
+    // 2. Card Resolution (Backend owns CardMapping)
+    let matricNumber = effectiveCardUid;
+    const mapping = await tx_ctx.cardMapping.findUnique({
+      where: { card_uid: effectiveCardUid },
+      select: { student_uid: true },
+    });
+
+    if (mapping) {
+      matricNumber = mapping.student_uid;
+    } else {
+
+      // Check if effectiveCardUid directly corresponds to an existing wallet/user (for backwards compatibility)
+      const directWallet = await tx_ctx.wallet.findUnique({
+        where: { student_uid: effectiveCardUid },
+        select: { student_uid: true },
+      });
+      if (!directWallet) {
+        childLogger.warn(
+          { cardUid: effectiveCardUid },
+          "ledger.card_not_registered"
+        );
+        return {
+          status: "CARD_NOT_REGISTERED" as const,
+          newBalance: null,
+          fare: amount,
+          transactionId: txId,
+        };
+      }
+    }
+
+    // 3. Blacklist Check (Backend owns domain validation)
+    const blacklisted = await tx_ctx.blacklist.findUnique({
+      where: { student_uid: matricNumber },
+      select: { student_uid: true },
+    });
+    if (blacklisted) {
+      childLogger.warn(
+        { matricNumber, cardUid: effectiveCardUid },
+        "ledger.student_is_blacklisted"
+      );
+      return {
+        status: "BLACKLISTED" as const,
+        newBalance: null,
+        fare: amount,
+        transactionId: txId,
+      };
+    }
+
+    // 4. Verify Student Wallet & Balance
+    const studentWallet = await tx_ctx.wallet.findUnique({
+      where: { student_uid: matricNumber },
+      select: { balance: true, is_linked: true },
+    });
+
+    if (!studentWallet || !studentWallet.is_linked) {
+      childLogger.warn(
+        { matricNumber },
+        "ledger.student_wallet_not_found_or_unlinked"
+      );
+      return {
+        status: "NOT_WHITELISTED" as const,
+        newBalance: null,
+        fare: amount,
+        transactionId: txId,
+      };
+    }
+
+    const currentStudentBalance = parseFloat(studentWallet.balance.toString());
+    if (currentStudentBalance < amount) {
+      childLogger.warn(
+        { balance: currentStudentBalance, fare: amount, matricNumber },
+        "ledger.student_insufficient_balance"
+      );
+      return {
+        status: "INSUFFICIENT_BALANCE" as const,
+        newBalance: currentStudentBalance,
+        fare: amount,
+        transactionId: txId,
+      };
+    }
+
+    // 5. Driver Authorization
+    const terminal = await tx_ctx.terminal.findUnique({
+      where: { terminal_id: terminalId },
+      select: { active_driver_uid: true },
+    });
+    const authorizedDriverUid = terminal?.active_driver_uid || null;
+
+    if (isV110L) {
+      if (!authorizedDriverUid || !driverUid || driverUid !== authorizedDriverUid) {
+        childLogger.warn(
+          {
+            payloadDriverUid: driverUid,
+            assignedDriverUid: authorizedDriverUid,
+            terminalId,
+            reason: "DRIVER_MISMATCH",
+          },
+          "ledger.driver_authorization_failed — payload driver does not match terminal active driver"
+        );
+        return {
+          status: "DRIVER_MISMATCH" as const,
+          newBalance: currentStudentBalance,
+          fare: amount,
+          transactionId: txId,
+        };
+      }
+
+      // Verify active driver exists in database
+      const driverUser = await tx_ctx.user.findFirst({
+        where: { matricNumber: authorizedDriverUid },
+        select: { id: true },
+      });
+      if (!driverUser) {
+        childLogger.warn(
+          {
+            payloadDriverUid: driverUid,
+            assignedDriverUid: authorizedDriverUid,
+            terminalId,
+            reason: "DRIVER_MISMATCH",
+          },
+          "ledger.driver_authorization_failed — active driver not registered in database"
+        );
+        return {
+          status: "DRIVER_MISMATCH" as const,
+          newBalance: currentStudentBalance,
+          fare: amount,
+          transactionId: txId,
+        };
+      }
+    } else {
+      if (driverUid && driverUid !== authorizedDriverUid) {
+        childLogger.warn(
+          {
+            payloadDriverUid: driverUid,
+            assignedDriverUid: authorizedDriverUid,
+          },
+          "ledger.driver_authorization — payload driver differs from terminal active driver, using authorized driver"
+        );
+      }
+    }
+
+    // Compute 4% fee deduction
+    const driverCredit = Math.round(amount * 96) / 100;
+    const cTransitCredit = Math.round((amount - driverCredit) * 100) / 100;
+
+    // 7. Create Transaction Record
+    await tx_ctx.transaction.create({
+      data: {
+        transaction_id: txId,
+        type: "RIDE",
+        terminal_id: terminalId,
+        student_uid: matricNumber,
+        amount: amount,
+        driver_uid: authorizedDriverUid,
+        location: location || null,
+        synced_at:
+          syncedAt ??
+          (timestamp ? new Date(timestamp * 1000) : new Date()),
+      },
+    });
+
+    // 8. Atomic Balance Updates
+
+    // A) Student: -100%
+    const updatedStudentWallet = await tx_ctx.wallet.update({
+      where: { student_uid: matricNumber },
+      data: { balance: { decrement: amount } },
+      select: { balance: true },
+    });
+    const newStudentBalance = parseFloat(
+      updatedStudentWallet.balance.toString()
+    );
+
+    // B) Driver: +96%
+    if (authorizedDriverUid) {
+      await tx_ctx.wallet.upsert({
+        where: { student_uid: authorizedDriverUid },
+        update: { balance: { increment: driverCredit } },
+        create: {
+          student_uid: authorizedDriverUid,
+          balance: driverCredit,
+          is_linked: true,
+        },
+      });
+    }
+
+    // C) C-Transit Platform: +4%
+    const cTransitAccount = "CTRANSIT";
+    await tx_ctx.wallet
+      .upsert({
+        where: { student_uid: cTransitAccount },
+        update: { balance: { increment: cTransitCredit } },
+        create: {
+          student_uid: cTransitAccount,
+          balance: cTransitCredit,
+          is_linked: true,
+        },
+      })
+      .catch((err) => {
+        childLogger.warn(
+          { err },
+          "ledger.ctransit_platform_fee_upsert_failed"
+        );
+      });
+
+    // 9. Low-balance auto-blacklisting in database
+    const belowThreshold = isBelowThreshold(newStudentBalance);
+    if (belowThreshold) {
+      await tx_ctx.blacklist.upsert({
+        where: { student_uid: matricNumber },
+        update: { blacklistedAt: new Date() },
+        create: { student_uid: matricNumber, reason: "LOW_BALANCE" },
+      });
+    }
+
+    childLogger.info(
+      {
+        previousBalance: currentStudentBalance,
+        newBalance: newStudentBalance,
+        fare: amount,
+        driverCredit,
+        cTransitCredit,
+        transactionId: txId,
+        belowThreshold,
+      },
+      "ledger.ride_settled_96_4_atomic"
+    );
+
+    return {
+      status: "SUCCESS" as const,
+      newBalance: newStudentBalance,
+      fare: amount,
+      driverAmount: driverCredit,
+      cTransitAmount: cTransitCredit,
+      transactionId: txId,
+      belowThreshold,
+    };
+  };
+
+  try {
+    if (
+      "$transaction" in dbClient &&
+      typeof dbClient.$transaction === "function"
+    ) {
+      return await (dbClient as typeof prisma).$transaction(execute, {
+        timeout: 15000,
+      });
+    } else {
+      return await execute(dbClient as Prisma.TransactionClient);
+    }
+  } catch (err: unknown) {
+    
+    // If concurrent insert failed with unique constraint on transaction_id, resolve as DUPLICATE
+    const isUniqueConstraint =
+      typeof err === "object" &&
+      err !== null &&
+      (("code" in err && err.code === "P2002") ||
+        ("message" in err &&
+          typeof err.message === "string" &&
+          (err.message.includes("Unique constraint") ||
+            err.message.includes("duplicate key"))));
+
+    if (isUniqueConstraint) {
+      childLogger.info(
+        { transactionId: txId },
+        "ledger.settle_ride_concurrent_duplicate_resolved"
+      );
+      const existing = await dbClient.transaction.findUnique({
+        where: { transaction_id: txId },
+      });
+      if (existing) {
+        const mapping = await dbClient.cardMapping.findUnique({
+          where: { card_uid: effectiveCardUid },
+          select: { student_uid: true },
+        });
+        const resolvedMatric = mapping ? mapping.student_uid : effectiveCardUid;
+        const currentWallet = await dbClient.wallet.findUnique({
+          where: { student_uid: resolvedMatric },
+          select: { balance: true },
+        });
+        const currentBalance = currentWallet
+          ? parseFloat(currentWallet.balance.toString())
+          : 0;
+        return {
+          status: "DUPLICATE" as const,
+          newBalance: currentBalance,
+          fare: amount,
+          transactionId: txId,
+        };
+      }
+    }
+    throw err;
+  }
+}
+
 export {
   deductFare,
+  settleRideTransaction,
   isBelowThreshold,
   hasCrossedAboveThreshold,
   activateWallet,

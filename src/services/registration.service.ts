@@ -1,4 +1,3 @@
-// src/services/registration.service.ts
 "use strict";
 
 import { activateWallet, prisma } from "./ledger.service.js";
@@ -15,63 +14,55 @@ export interface ConfirmRegistrationResult {
   cardUid?: string;
 }
 
-// ─────────────────────────────────────────────
-// handlePendingLink
-// Terminal sends PENDING_LINK when a card is tapped.
-// OTP is now persisted to DB (registration_otps table)
-// instead of Redis. TTL enforced via expires_at field.
-// ─────────────────────────────────────────────
+// Handle Current Card linking
 async function handlePendingLink(
   terminalId: string,
   linkData: PendingLinkData
 ): Promise<void> {
+  const activeTerminalId = linkData.device_id || terminalId;
   const log = logger.child({
-    terminalId,
+    terminalId: activeTerminalId,
     cardUid: linkData.uid,
     otp: linkData.otp,
+    agentUid: linkData.agent_uid,
   });
 
   const expiresAt = new Date(Date.now() + 5 * 60 * 1000); // 5 minutes
 
-  // Upsert — if same card taps again, refresh the OTP record
+  // If same card taps again, refresh the OTP record
   await prisma.registrationOtp.upsert({
     where: { otp: linkData.otp },
     update: {
       card_uid: linkData.uid,
-      terminal_id: terminalId,
+      terminal_id: activeTerminalId,
       expires_at: expiresAt,
       used: false,
     },
     create: {
       otp: linkData.otp,
       card_uid: linkData.uid,
-      terminal_id: terminalId,
+      terminal_id: activeTerminalId,
       expires_at: expiresAt,
     },
   });
 
-  log.info({ expiresAt, otp: linkData.otp }, "registration.otp_saved_to_db");
+  log.info({ expiresAt, agentUid: linkData.agent_uid }, "registration.otp_saved_to_db");
 
   try {
-    await publishToTerminal(terminalId, `REG:OTP,${linkData.otp}`);
-    log.info({ otp: linkData.otp }, "registration.otp_sent_to_terminal_screen");
+    await publishToTerminal(activeTerminalId, `REG:OTP,${linkData.otp}`);
+    log.info("registration.otp_sent_to_terminal_screen");
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : "Unknown error";
     log.error({ err: errMsg }, "registration.failed_to_send_otp_to_terminal");
   }
 }
 
-// ─────────────────────────────────────────────
 // confirmRegistration
-// Called when student submits OTP from frontend.
-// Looks up OTP in DB, validates, links card,
-// activates wallet, and broadcasts ADD:WL.
-// ─────────────────────────────────────────────
 async function confirmRegistration(
   otp: string,
   userId: string
 ): Promise<ConfirmRegistrationResult> {
-  const log = logger.child({ otp, userId });
+  const log = logger.child({ userId });
 
   // Look up OTP in DB
   const otpRecord = await prisma.registrationOtp.findUnique({
@@ -145,7 +136,7 @@ async function confirmRegistration(
     where: { otp },
     data: { used: true },
   });
-  log.debug({ otp }, "registration.otp_consumed");
+  log.debug("registration.otp_consumed");
 
   const addWlCmd = buildDeltaCommand("ADD", "WL", cardUid);
 

@@ -29,15 +29,42 @@ const REQUIRED_VARS = [
   "JWT_SECRET",
 ] as const;
 
+const isProduction = process.env.NODE_ENV === "production";
+
 const missing = REQUIRED_VARS.filter((key) => !process.env[key]);
 
 if (missing.length > 0) {
-  if (process.env.NODE_ENV === "production") {
+  if (isProduction) {
     process.stderr.write(
       JSON.stringify({
         level: "fatal",
         msg: "Missing required environment variables. Halting.",
         missing,
+      }) + "\n"
+    );
+    process.exit(1);
+  }
+}
+
+// In production, prohibit development fallback/default secrets
+if (isProduction) {
+  const disallowedDefaults: Record<string, string> = {
+    MQTT_INTERNAL_SECRET: "dev_secret",
+    JWT_SECRET: "dev_jwt_secret",
+    MQTT_PASSWORD: "dev_pass",
+    MQTT_USERNAME: "dev_user",
+  };
+
+  const detectedDefaults = Object.entries(disallowedDefaults)
+    .filter(([varName, defVal]) => process.env[varName] === defVal)
+    .map(([varName]) => varName);
+
+  if (detectedDefaults.length > 0) {
+    process.stderr.write(
+      JSON.stringify({
+        level: "fatal",
+        msg: "Insecure default/fallback secrets detected in production environment. Halting.",
+        variables: detectedDefaults,
       }) + "\n"
     );
     process.exit(1);
@@ -74,25 +101,25 @@ const env: Config = {
   NODE_ENV: process.env.NODE_ENV || "development",
   PORT: parseIntSafe(process.env.PORT, 3000),
   db: {
-    url: process.env.DATABASE_URL || "postgresql://mock:mock@localhost:5432/ctransit",
-    pooledUrl: process.env.DATABASE_URL_POOLED || "postgresql://mock:mock@localhost:5432/ctransit",
+    url: process.env.DATABASE_URL as string,
+    pooledUrl: process.env.DATABASE_URL_POOLED as string,
   },
   mqtt: {
-    host: process.env.HIVEMQ_CLUSTER_URL || "localhost",
+    host: process.env.HIVEMQ_CLUSTER_URL as string,
     port: parseIntSafe(process.env.HIVEMQ_PORT, 8883),
-    clientId: process.env.HIVEMQ_CLIENT_ID || "ctransit-mqtt-dev",
-    username: process.env.MQTT_USERNAME || "dev_user",
-    password: process.env.MQTT_PASSWORD || "dev_pass",
-    internalSecret: process.env.MQTT_INTERNAL_SECRET || "dev_secret",
+    clientId: process.env.HIVEMQ_CLIENT_ID as string,
+    username: process.env.MQTT_USERNAME as string,
+    password: process.env.MQTT_PASSWORD as string,
+    internalSecret: process.env.MQTT_INTERNAL_SECRET as string,
   },
   redis: {
-    url: process.env.REDIS_URL || "redis://localhost:6379",
+    url: process.env.REDIS_URL as string,
   },
   ledger: {
     baseFare: parseFloatSafe(process.env.BASE_FARE, 150),
   },
   jwt: {
-    secret: process.env.JWT_SECRET || "dev_jwt_secret",
+    secret: process.env.JWT_SECRET as string,
   },
 };
 

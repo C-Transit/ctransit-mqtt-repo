@@ -1,8 +1,10 @@
-// src/services/ingestion.service.ts
 "use strict";
 
-import { prisma, isBelowThreshold } from "./ledger.service.js";
-import type { Prisma } from "@prisma/client";
+import {
+  isBelowThreshold,
+  settleRideTransaction,
+  type SettleRideParams,
+} from "./ledger.service.js";
 import logger from "../config/logger.js";
 import {
   parseTransactionBatch,
@@ -11,37 +13,10 @@ import {
 } from "../utils/parser.js";
 import { broadcastDeltaToFleet } from "./sync.service.js";
 import { publishToTerminal } from "../mqtt/downlinkQueue.js";
-import { getRedisClient, cacheKeys } from "../config/redis.js";
 
 type LoggerInstance = typeof logger;
 
-const CARD_CACHE_TTL_SECONDS = 604800; // 7 days TTL
-
-// ── Cache Helper: Card Mapping ────────────────────────────────────────────────
-// Maps hardware card UID → student matricNumber in Redis with a 7-day TTL.
-// Invalidated on card re-link in registration.service.ts.
-async function resolveCardUid(cardUid: string): Promise<string | null> {
-  const redis = getRedisClient();
-  const key = cacheKeys.cardMap(cardUid);
-
-  const cached = await redis.get(key);
-  if (cached) return cached as string;
-
-  const mapping = await prisma.cardMapping.findUnique({
-    where: { card_uid: cardUid },
-    select: { student_uid: true },
-  });
-
-  if (!mapping) return null;
-
-  // Cache with 7-day TTL
-  await redis.set(key, mapping.student_uid, "EX", CARD_CACHE_TTL_SECONDS);
-
-  return mapping.student_uid;
-}
-
-// ── Main Ingestion Logic ──────────────────────────────────────────────────────
-
+// Ingests a batch of transaction payloads from a terminal, validates each row, and forwards valid transactions to the backend for settlement. Invalid rows are logged and acknowledged with an error response to the terminal.
 async function ingestTransactionBatch(
   terminalId: string,
   rawPayload: string
@@ -51,8 +26,23 @@ async function ingestTransactionBatch(
 
   const { valid, invalid } = parseTransactionBatch(rawPayload, terminalId);
 
+  // Error Isolation: structured error logging for malformed rows
   if (invalid.length > 0) {
-    log.warn({ invalidRows: invalid }, "ingestion.invalid_rows_skipped");
+    log.warn(
+      { invalidRows: invalid, terminalId },
+      "ingestion.invalid_rows_detected"
+    );
+    for (const item of invalid) {
+      const firstToken = item.line.split(",")[0]?.trim();
+      if (firstToken && firstToken.length > 0 && !firstToken.includes(":")) {
+        publishToTerminal(
+          terminalId,
+          `ACK:FAIL,${firstToken},MALFORMED_PAYLOAD`
+        ).catch((err) => {
+          log.error({ err }, "ingestion.invalid_row_ack_failed");
+        });
+      }
+    }
   }
 
   if (valid.length === 0) {
@@ -60,179 +50,190 @@ async function ingestTransactionBatch(
     return;
   }
 
-  // Optimize: query terminal active driver once per batch instead of per transaction
-  const terminal = await prisma.terminal.findUnique({
-    where: { terminal_id: terminalId },
-    select: { active_driver_uid: true },
-  });
-  const defaultDriverUid = terminal?.active_driver_uid || null;
-
+  // Process each valid transaction independently with isolated error boundary
   for (const tx of valid) {
-    await processTransaction(tx, terminalId, defaultDriverUid, log);
+    await processTransaction(tx, terminalId, log);
   }
 
   log.info({ processedCount: valid.length }, "ingestion.batch_complete");
 }
 
+// Processes a single transaction, forwards it to the backend for settlement, and handles the response by sending an appropriate ACK to the terminal. Errors are logged and result in a SERVER_ERROR ACK.
 async function processTransaction(
   tx: ParsedTransaction,
   terminalId: string,
-  defaultDriverUid: string | null,
   log: LoggerInstance
 ): Promise<void> {
+  const effectiveCardUid = tx.card_uid || tx.student_uid;
+  const effectiveTerminalId = tx.terminal_id || terminalId;
+
   const txLog = log.child({
     transactionId: tx.transaction_id,
-    cardUid: tx.student_uid,
+    cardUid: effectiveCardUid,
+    terminalId: effectiveTerminalId,
+    location: tx.location,
+    driverUid: tx.driver_uid,
   });
 
   try {
-    // ── STEP 0: Resolve card UID → matricNumber (Redis cached with TTL) ───
-    const matricNumber = await resolveCardUid(tx.student_uid);
+    const backendPayload: SettleRideParams = {
+      protocolVersion: tx.location ? "v1.1.0L" : undefined,
+      terminalId: effectiveTerminalId,
+      studentUid: effectiveCardUid,
+      cardUid: effectiveCardUid,
+      rawAmount: tx.raw_amount,
+      amount: tx.amount,
+      timestamp: tx.timestamp,
+      driverUid: tx.driver_uid || null,
+      location: tx.location || null,
+      transactionId: tx.transaction_id,
+      syncedAt: tx.synced_at,
+    };
 
-    if (!matricNumber) {
-      txLog.warn("ingestion.card_uid_not_registered");
-      await publishToTerminal(
-        terminalId,
-        `ACK:FAIL,${tx.student_uid},CARD_NOT_REGISTERED`
-      );
-      return;
-    }
+    const result = await settleRideTransaction(backendPayload);
 
-    txLog.info({ matricNumber }, "ingestion.card_uid_resolved");
-
-    // ── STEP 1 & 2: Check wallet whitelist and blacklist in parallel ──────
-    const [wallet, blacklisted] = await Promise.all([
-      prisma.wallet.findUnique({
-        where: { student_uid: matricNumber },
-        select: { balance: true, is_linked: true },
-      }),
-      prisma.blacklist.findUnique({
-        where: { student_uid: matricNumber },
-        select: { student_uid: true },
-      }),
-    ]);
-
-    const walletData = wallet
-      ? {
-          balance: parseFloat(wallet.balance.toString()),
-          is_linked: wallet.is_linked,
-        }
-      : null;
-
-    if (!walletData || !walletData.is_linked) {
-      txLog.warn({ matricNumber }, "ingestion.student_not_whitelisted");
-      await publishToTerminal(
-        terminalId,
-        `ACK:FAIL,${tx.student_uid},NOT_WHITELISTED`
-      );
-      return;
-    }
-
-    if (blacklisted) {
-      txLog.warn({ matricNumber }, "ingestion.student_is_blacklisted");
-      await publishToTerminal(
-        terminalId,
-        `ACK:FAIL,${tx.student_uid},BLACKLISTED`
-      );
-      return;
-    }
-
-    const currentBalance = walletData.balance;
-    const driverUid = tx.driver_uid || defaultDriverUid;
-
-    // ── All checks passed — deduct atomically with idempotency ─────────────
-    const result = await prisma.$transaction(
-      async (tx_ctx: Prisma.TransactionClient) => {
-        const existingTx = await tx_ctx.transaction.findUnique({
-          where: { transaction_id: tx.transaction_id },
-        });
-
-        if (existingTx) {
-          txLog.debug("ingestion.duplicate_transaction_skipped");
-          return { duplicate: true, newBalance: currentBalance };
-        }
-
-        await tx_ctx.transaction.create({
-          data: {
-            transaction_id: tx.transaction_id,
-            type: "RIDE",
-            terminal_id: tx.terminal_id,
-            student_uid: matricNumber,
-            amount: tx.amount,
-            driver_uid: driverUid,
-            synced_at: tx.synced_at,
-          },
-        });
-
-        const updatedWallet = await tx_ctx.wallet.update({
-          where: { student_uid: matricNumber },
-          data: { balance: { decrement: tx.amount } },
-          select: { balance: true },
-        });
-
-        const newBalance = parseFloat(updatedWallet.balance.toString());
-
+    switch (result.status) {
+      case "SUCCESS": {
+        const balanceStr = (result.newBalance ?? 0).toFixed(2);
+        await publishToTerminal(
+          effectiveTerminalId,
+          `ACK:OK,${effectiveCardUid},${balanceStr}`
+        );
         txLog.info(
-          {
-            previousBalance: currentBalance,
-            newBalance,
-            driverUid,
-            matricNumber,
-          },
-          "ingestion.fare_deducted"
+          { newBalance: result.newBalance, cardUid: effectiveCardUid },
+          "ingestion.ack_sent_to_terminal"
         );
 
-        return { duplicate: false, newBalance };
-      },
-      { timeout: 15000 }
-    );
-
-    if (result.duplicate) return;
-
-    const { newBalance } = result;
-
-    // ACK to terminal — no cache to invalidate, DB is source of truth
-    await publishToTerminal(
-      terminalId,
-      `ACK:OK,${tx.student_uid},${newBalance.toFixed(2)}`
-    );
-    txLog.info({ newBalance, matricNumber }, "ingestion.ack_sent_to_terminal");
-
-    // ── Post-deduction blacklist check ────────────────────────────────────
-    if (isBelowThreshold(newBalance)) {
-      const blacklistCmd = buildDeltaCommand("ADD", "BL", tx.student_uid);
-      txLog.info(
-        { newBalance, matricNumber },
-        "ingestion.balance_now_below_threshold — blacklisting"
-      );
-
-      process.nextTick(async () => {
-        try {
-          await prisma.blacklist.upsert({
-            where: { student_uid: matricNumber },
-            update: { blacklistedAt: new Date() },
-            create: { student_uid: matricNumber, reason: "LOW_BALANCE" },
-          });
-
-          await broadcastDeltaToFleet(blacklistCmd);
-
-          txLog.info({ blacklistCmd }, "ingestion.blacklist_broadcast_sent");
-        } catch (err) {
-          const errMsg = err instanceof Error ? err.message : "Unknown error";
-          txLog.error(
-            { err: errMsg },
-            "ingestion.post_deduction_blacklist_failed"
+        // Post-deduction blacklist broadcast to terminal fleet
+        if (
+          result.belowThreshold ||
+          (result.newBalance !== null && isBelowThreshold(result.newBalance))
+        ) {
+          const blacklistCmd = buildDeltaCommand("ADD", "BL", effectiveCardUid);
+          txLog.info(
+            { newBalance: result.newBalance, cardUid: effectiveCardUid },
+            "ingestion.balance_now_below_threshold — broadcasting blacklist delta"
           );
+
+          process.nextTick(async () => {
+            try {
+              await broadcastDeltaToFleet(blacklistCmd);
+              txLog.info(
+                { blacklistCmd },
+                "ingestion.blacklist_broadcast_sent"
+              );
+            } catch (err) {
+              const errMsg =
+                err instanceof Error ? err.message : "Unknown error";
+              txLog.error(
+                { err: errMsg },
+                "ingestion.post_deduction_blacklist_broadcast_failed"
+              );
+            }
+          });
         }
-      });
+        break;
+      }
+
+      case "DUPLICATE": {
+        txLog.info(
+          { transactionId: result.transactionId || tx.transaction_id },
+          "ingestion.duplicate_transaction_acknowledged"
+        );
+        // ACK with current balance so terminal clears retry queue without double charging
+        const balanceStr = (result.newBalance ?? 0).toFixed(2);
+        await publishToTerminal(
+          effectiveTerminalId,
+          `ACK:OK,${effectiveCardUid},${balanceStr}`
+        );
+        break;
+      }
+
+      case "INSUFFICIENT_BALANCE": {
+        txLog.warn(
+          { cardUid: effectiveCardUid, fare: tx.amount },
+          "ingestion.insufficient_balance"
+        );
+        await publishToTerminal(
+          effectiveTerminalId,
+          `ACK:FAIL,${effectiveCardUid},INSUFFICIENT_BALANCE`
+        );
+        break;
+      }
+
+      case "BLACKLISTED": {
+        txLog.warn(
+          { cardUid: effectiveCardUid },
+          "ingestion.student_is_blacklisted"
+        );
+        await publishToTerminal(
+          effectiveTerminalId,
+          `ACK:FAIL,${effectiveCardUid},BLACKLISTED`
+        );
+        break;
+      }
+
+      case "CARD_NOT_REGISTERED": {
+        txLog.warn(
+          { cardUid: effectiveCardUid },
+          "ingestion.card_uid_not_registered"
+        );
+        await publishToTerminal(
+          effectiveTerminalId,
+          `ACK:FAIL,${effectiveCardUid},CARD_NOT_REGISTERED`
+        );
+        break;
+      }
+
+      case "NOT_WHITELISTED":
+      case "NOT_FOUND": {
+        txLog.warn(
+          { cardUid: effectiveCardUid },
+          "ingestion.student_not_whitelisted"
+        );
+        await publishToTerminal(
+          effectiveTerminalId,
+          `ACK:FAIL,${effectiveCardUid},NOT_WHITELISTED`
+        );
+        break;
+      }
+
+      case "DRIVER_MISMATCH": {
+        txLog.warn(
+          {
+            cardUid: effectiveCardUid,
+            driverUid: tx.driver_uid,
+            terminalId: effectiveTerminalId,
+            reason: "DRIVER_MISMATCH",
+          },
+          "ingestion.driver_mismatch_rejected"
+        );
+        await publishToTerminal(
+          effectiveTerminalId,
+          `ACK:FAIL,${effectiveCardUid},DRIVER_MISMATCH`
+        );
+        break;
+      }
+
+      default: {
+        txLog.error(
+          { status: result.status },
+          "ingestion.unhandled_settlement_status"
+        );
+        await publishToTerminal(
+          effectiveTerminalId,
+          `ACK:FAIL,${effectiveCardUid},SERVER_ERROR`
+        );
+        break;
+      }
     }
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : "Unknown error";
     txLog.error({ err: errMsg }, "ingestion.transaction_processing_error");
     try {
       await publishToTerminal(
-        terminalId,
-        `ACK:FAIL,${tx.student_uid},SERVER_ERROR`
+        effectiveTerminalId,
+        `ACK:FAIL,${effectiveCardUid},SERVER_ERROR`
       );
     } catch (ackErr) {
       const ackErrMsg =

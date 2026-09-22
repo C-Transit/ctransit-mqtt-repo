@@ -1,19 +1,17 @@
 import { PrismaClient } from "@prisma/client";
 import env from "../config/env.js";
+import logger from "../config/logger.js";
 
-const isProduction = env.NODE_ENV === "production";
+const databaseUrl = env.NODE_ENV === "production" ? env.db.pooledUrl : env.db.url;
 
-// ✅ Connection strategy:
-//   Production  → pooled URL (PgBouncer on Neon) — handles high concurrency
-//   Development → direct URL — supports all Prisma features (no pgbouncer limitations)
-const databaseUrl = isProduction ? env.db.pooledUrl : env.db.url;
+if (!databaseUrl) {
+  throw new Error("DATABASE_URL is not configured. Set the real PostgreSQL connection string before starting the service.");
+}
 
+// Real Prisma client. This is the single source of truth for all persistent data.
 const prisma = new PrismaClient({
-  // ✅ Log slow queries and errors in dev, errors only in production
-  log: isProduction ? ["error"] : ["warn", "error"],
-
-  errorFormat: "minimal", // Shorter errors — better for structured logging
-
+  log: env.NODE_ENV === "production" ? ["error"] : ["warn", "error"],
+  errorFormat: "minimal",
   datasources: {
     db: {
       url: databaseUrl,
@@ -21,4 +19,7 @@ const prisma = new PrismaClient({
   },
 });
 
+logger.info({ databaseUrl }, "prisma.connected_real_database");
+
+export { prisma };
 export default prisma;

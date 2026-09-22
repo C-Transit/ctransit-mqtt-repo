@@ -5,10 +5,8 @@ import {
   routeDeltaToTerminal,
 } from "../services/sync.service.js";
 import logger from "../config/logger.js";
-// src/controllers/internal.controller.ts – add this function
-
 import { deductFare, isBelowThreshold, prisma } from '../services/ledger.service.js';
-import { buildDeltaCommand } from '../utils/parser.js';
+import { buildDeltaCommand, normalizeDownlinkCommand } from '../utils/parser.js';
 
 export const testDeduct = async (req: Request, res: Response) => {
   const { studentUid, amount, terminalId } = req.body;
@@ -47,12 +45,14 @@ export const testDeduct = async (req: Request, res: Response) => {
   // 3. Check if below threshold
   if (isBelowThreshold(newBalance)) {
     log.info('test.balance_below_threshold — blacklisting');
+
     // Add to blacklist DB
     await prisma.blacklist.upsert({
       where: { student_uid: studentUid },
       update: { blacklistedAt: new Date() },
       create: { student_uid: studentUid, reason: 'LOW_BALANCE' },
     });
+    
     // Broadcast to all terminals
     const command = buildDeltaCommand('ADD', 'BL', cardUid);
     await broadcastDeltaToFleet(command);
@@ -74,13 +74,14 @@ export const testDeduct = async (req: Request, res: Response) => {
 };
 
 export const handleBroadcast = async (req: Request, res: Response) => {
-  const { command } = req.body;
-  if (!command || typeof command !== "string") {
+  const { command: rawCommand } = req.body;
+  if (!rawCommand || typeof rawCommand !== "string") {
     return res
       .status(400)
       .json({ error: 'Missing or invalid "command" field' });
   }
 
+  const command = normalizeDownlinkCommand(rawCommand);
   logger.debug({ command }, "internal.broadcast_request");
   await broadcastDeltaToFleet(command);
   res.json({ success: true, command });
@@ -91,9 +92,9 @@ export const handleRoute = async (req: Request, res: Response) => {
   const terminalId = Array.isArray(terminalIdRaw)
     ? terminalIdRaw[0]
     : terminalIdRaw;
-  const { command } = req.body;
+  const { command: rawCommand } = req.body;
 
-  if (!command || typeof command !== "string") {
+  if (!rawCommand || typeof rawCommand !== "string") {
     return res
       .status(400)
       .json({ error: 'Missing or invalid "command" field' });
@@ -103,6 +104,7 @@ export const handleRoute = async (req: Request, res: Response) => {
     return res.status(400).json({ error: "Missing terminalId in path" });
   }
 
+  const command = normalizeDownlinkCommand(rawCommand);
   logger.debug({ terminalId, command }, "internal.route_request");
   await routeDeltaToTerminal(terminalId, command);
   res.json({ success: true, terminalId, command });

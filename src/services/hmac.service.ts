@@ -1,4 +1,3 @@
-// src/services/hmac.service.ts
 import crypto from "crypto";
 import { prisma } from "./ledger.service.js";
 import logger from "../config/logger.js";
@@ -8,11 +7,7 @@ export interface HmacVerifyResult {
   terminalId: string;
 }
 
-// ─────────────────────────────────────────────
-// getTerminalSecret
-// Direct DB lookup — terminal secret cache removed.
-// Redis no longer used here.
-// ─────────────────────────────────────────────
+// Retrieves the secret key for a given terminal from the database.
 async function getTerminalSecret(terminalId: string): Promise<string | null> {
   const terminal = await prisma.terminal.findUnique({
     where: { terminal_id: terminalId },
@@ -23,6 +18,7 @@ async function getTerminalSecret(terminalId: string): Promise<string | null> {
   return terminal.secret_key;
 }
 
+// Computes the HMAC signature for a given payload using the terminal's secret key.
 function computeHmac(
   secretKey: string,
   terminalId: string,
@@ -34,6 +30,7 @@ function computeHmac(
     .digest("hex");
 }
 
+// Verifies the HMAC signature of an incoming message and unwraps the payload if valid.
 async function verifyAndUnwrap(
   terminalId: string,
   rawMessage: string
@@ -65,6 +62,7 @@ async function verifyAndUnwrap(
     return null;
   }
 
+  // Retrieve the terminal's secret key from the database
   const secretKey = await getTerminalSecret(terminalId);
 
   if (!secretKey) {
@@ -85,10 +83,7 @@ async function verifyAndUnwrap(
   );
 
   if (!signaturesMatch) {
-    log.warn(
-      { receivedSig, expectedSig },
-      "hmac.signature_mismatch — rejecting message"
-    );
+    log.warn("hmac.signature_mismatch — rejecting message");
     return null;
   }
 
@@ -99,7 +94,6 @@ async function verifyAndUnwrap(
 // No-op now — kept so admin.controller.ts import doesn't break
 // if it's still referenced anywhere. Safe to remove later.
 async function invalidateTerminalSecretCache(): Promise<void> {
-  // Terminal secret cache removed — nothing to invalidate
 }
 
 export { verifyAndUnwrap, invalidateTerminalSecretCache, computeHmac };
