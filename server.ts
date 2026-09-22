@@ -7,7 +7,7 @@ import express from "express";
 import cors from "cors";
 import morgan from "morgan";
 import { connectMqtt, disconnectMqtt } from "./src/mqtt/client.js";
-import { getRedisClient } from "./src/config/redis.js";
+import { getRedisClient, waitForRedisReady } from "./src/config/redis.js";
 import { prisma } from "./src/lib/prisma.js";
 import healthRouter from "./src/routes/health.routes.js";
 import internalRouter from "./src/routes/internal.routes.js";
@@ -50,6 +50,7 @@ async function boot(): Promise<void> {
 
   try {
     const redis = getRedisClient();
+    await waitForRedisReady(redis);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (redis as any).ping();
     logger.info("mqtt_service.redis_ready");

@@ -28,6 +28,28 @@ function setRedisClient(client: Redis): void {
   redisClient = client;
 }
 
+async function waitForRedisReady(client: Redis): Promise<void> {
+  if (client.status === "ready") return;
+
+  await new Promise<void>((resolve, reject) => {
+    const onReady = () => {
+      cleanup();
+      resolve();
+    };
+    const onError = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
+    const cleanup = () => {
+      client.off("ready", onReady);
+      client.off("error", onError);
+    };
+
+    client.once("ready", onReady);
+    client.once("error", onError);
+  });
+}
+
 // MQTT Bridge & Terminal Queue Keys
 // These are the ONLY Redis keys used in the MQTT service.
 const redisKeys = {
@@ -44,5 +66,12 @@ const cacheKeys = {
   cardMap: (cardUid: string): string => `card:map:${cardUid}`,
 };
 
-export { getRedisClient, setRedisClient, Redis, redisKeys, cacheKeys };
+export {
+  getRedisClient,
+  setRedisClient,
+  waitForRedisReady,
+  Redis,
+  redisKeys,
+  cacheKeys,
+};
 
