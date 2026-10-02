@@ -152,6 +152,13 @@ export function computeDeterministicFingerprint(params: {
   return crypto.createHash("sha256").update(input).digest("hex");
 }
 
+/**
+ * Canonical id of the C-Transit system wallet row.
+ * Must match the `SystemWallet.id` default in prisma/schema.prisma.
+ */
+const SYSTEM_WALLET_ID = "CTRANSIT_SYSTEM";
+const SYSTEM_WALLET_NAME = "C-Transit Platform";
+
 async function settleRideTransaction(
   params: SettleRideParams,
   dbClient: DbClient = prisma
@@ -410,7 +417,7 @@ async function settleRideTransaction(
     const driverCredit = Math.round(amount * 96) / 100;
     const cTransitCredit = Math.round((amount - driverCredit) * 100) / 100;
 
-    // 7. Create Transaction Record
+    // 7. Create Transaction Record (with full split persisted for audit)
     await tx_ctx.transaction.create({
       data: {
         transaction_id: txId,
@@ -418,8 +425,13 @@ async function settleRideTransaction(
         terminal_id: terminalId,
         student_uid: matricNumber,
         amount: amount,
+        fare: amount,
+        driver_share: driverCredit,
+        ctransit_share: cTransitCredit,
         driver_uid: authorizedDriverUid,
         location: location || null,
+        card_uid: effectiveCardUid,
+        tapped_at: timestamp !== undefined ? new Date(timestamp * 1000) : null,
         synced_at:
           syncedAt ?? (timestamp ? new Date(timestamp * 1000) : new Date()),
       },
@@ -437,34 +449,37 @@ async function settleRideTransaction(
       updatedStudentWallet.balance.toString()
     );
 
-    // B) Driver: +96%
+    // B) Driver: +96%  → uses DriverWallet, NOT Wallet
     if (authorizedDriverUid) {
-      await tx_ctx.wallet.upsert({
-        where: { student_uid: authorizedDriverUid },
-        update: { balance: { increment: driverCredit } },
+      await tx_ctx.driverWallet.upsert({
+        where: { driver_uid: authorizedDriverUid },
+        update: {
+          balance: { increment: driverCredit },
+          total_earnings: { increment: driverCredit },
+        },
         create: {
-          student_uid: authorizedDriverUid,
+          driver_uid: authorizedDriverUid,
           balance: driverCredit,
-          is_linked: true,
+          total_earnings: driverCredit,
         },
       });
     }
 
-    // C) C-Transit Platform: +4%
-    const cTransitAccount = "CTRANSIT";
-    await tx_ctx.wallet
-      .upsert({
-        where: { student_uid: cTransitAccount },
-        update: { balance: { increment: cTransitCredit } },
-        create: {
-          student_uid: cTransitAccount,
-          balance: cTransitCredit,
-          is_linked: true,
-        },
-      })
-      .catch((err) => {
-        childLogger.warn({ err }, "ledger.ctransit_platform_fee_upsert_failed");
-      });
+    // C) C-Transit Platform: +4%  → uses SystemWallet, NOT Wallet
+    // No `.catch()` — if this fails, the whole transaction must roll back.
+    await tx_ctx.systemWallet.upsert({
+      where: { id: SYSTEM_WALLET_ID },
+      update: {
+        balance: { increment: cTransitCredit },
+        total_revenue: { increment: cTransitCredit },
+      },
+      create: {
+        id: SYSTEM_WALLET_ID,
+        name: SYSTEM_WALLET_NAME,
+        balance: cTransitCredit,
+        total_revenue: cTransitCredit,
+      },
+    });
 
     // 9. Low-balance auto-blacklisting in database
     const belowThreshold = isBelowThreshold(newStudentBalance);
