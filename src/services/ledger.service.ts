@@ -6,7 +6,6 @@ import type { Prisma } from "@prisma/client";
 import logger from "../config/logger.js";
 import env from "../config/env.js";
 
-
 // Support both standard PrismaClient and Transactional Client
 type DbClient = typeof prisma | Prisma.TransactionClient;
 
@@ -193,7 +192,6 @@ async function settleRideTransaction(
       location,
     });
   } else {
-
     // Legacy fallback format
     const ts =
       timestamp !== undefined
@@ -212,7 +210,6 @@ async function settleRideTransaction(
   });
 
   const execute = async (tx_ctx: Prisma.TransactionClient) => {
-
     // 1. Idempotency Check
     const existingTx = await tx_ctx.transaction.findUnique({
       where: { transaction_id: txId },
@@ -255,7 +252,6 @@ async function settleRideTransaction(
     if (mapping) {
       matricNumber = mapping.student_uid;
     } else {
-
       // Check if effectiveCardUid directly corresponds to an existing wallet/user (for backwards compatibility)
       const directWallet = await tx_ctx.wallet.findUnique({
         where: { student_uid: effectiveCardUid },
@@ -326,23 +322,14 @@ async function settleRideTransaction(
       };
     }
 
-    // 5. Driver Authorization
-    const terminal = await tx_ctx.terminal.findUnique({
-      where: { terminal_id: terminalId },
-      select: { active_driver_uid: true },
-    });
-    const authorizedDriverUid = terminal?.active_driver_uid || null;
+    // 5. Driver Authorization (Direct DB verification)
+    let authorizedDriverUid: string | null;
 
     if (isV110L) {
-      if (!authorizedDriverUid || !driverUid || driverUid !== authorizedDriverUid) {
+      if (!driverUid) {
         childLogger.warn(
-          {
-            payloadDriverUid: driverUid,
-            assignedDriverUid: authorizedDriverUid,
-            terminalId,
-            reason: "DRIVER_MISMATCH",
-          },
-          "ledger.driver_authorization_failed — payload driver does not match terminal active driver"
+          { terminalId, reason: "DRIVER_MISMATCH" },
+          "ledger.driver_authorization_failed — no driverUid provided in payload"
         );
         return {
           status: "DRIVER_MISMATCH" as const,
@@ -352,20 +339,44 @@ async function settleRideTransaction(
         };
       }
 
-      // Verify active driver exists in database
+      // Verify the payload card UID exists in DriverCardCredential
+      const driverCredential = await tx_ctx.driverCardCredential.findUnique({
+        where: { card_uid: driverUid },
+        select: { driver_uid: true },
+      });
+
+      if (!driverCredential) {
+        childLogger.warn(
+          {
+            payloadDriverUid: driverUid,
+            terminalId,
+            reason: "DRIVER_MISMATCH",
+          },
+          "ledger.driver_authorization_failed — unregistered driver card"
+        );
+        return {
+          status: "DRIVER_MISMATCH" as const,
+          newBalance: currentStudentBalance,
+          fare: amount,
+          transactionId: txId,
+        };
+      }
+
+      // Verify the driver user profile is active and has the correct DRIVER role
       const driverUser = await tx_ctx.user.findFirst({
-        where: { matricNumber: authorizedDriverUid },
+        where: { matricNumber: driverCredential.driver_uid, role: "DRIVER" },
         select: { id: true },
       });
+
       if (!driverUser) {
         childLogger.warn(
           {
             payloadDriverUid: driverUid,
-            assignedDriverUid: authorizedDriverUid,
+            resolvedMatric: driverCredential.driver_uid,
             terminalId,
             reason: "DRIVER_MISMATCH",
           },
-          "ledger.driver_authorization_failed — active driver not registered in database"
+          "ledger.driver_authorization_failed — active driver not registered in database or not a DRIVER"
         );
         return {
           status: "DRIVER_MISMATCH" as const,
@@ -374,7 +385,16 @@ async function settleRideTransaction(
           transactionId: txId,
         };
       }
+
+      authorizedDriverUid = driverCredential.driver_uid;
     } else {
+      // Legacy behavior: use the terminal's active driver state
+      const terminal = await tx_ctx.terminal.findUnique({
+        where: { terminal_id: terminalId },
+        select: { active_driver_uid: true },
+      });
+      authorizedDriverUid = terminal?.active_driver_uid || null;
+
       if (driverUid && driverUid !== authorizedDriverUid) {
         childLogger.warn(
           {
@@ -386,7 +406,7 @@ async function settleRideTransaction(
       }
     }
 
-    // Compute 4% fee deduction
+    // 6. Compute 4% fee deduction
     const driverCredit = Math.round(amount * 96) / 100;
     const cTransitCredit = Math.round((amount - driverCredit) * 100) / 100;
 
@@ -401,8 +421,7 @@ async function settleRideTransaction(
         driver_uid: authorizedDriverUid,
         location: location || null,
         synced_at:
-          syncedAt ??
-          (timestamp ? new Date(timestamp * 1000) : new Date()),
+          syncedAt ?? (timestamp ? new Date(timestamp * 1000) : new Date()),
       },
     });
 
@@ -444,10 +463,7 @@ async function settleRideTransaction(
         },
       })
       .catch((err) => {
-        childLogger.warn(
-          { err },
-          "ledger.ctransit_platform_fee_upsert_failed"
-        );
+        childLogger.warn({ err }, "ledger.ctransit_platform_fee_upsert_failed");
       });
 
     // 9. Low-balance auto-blacklisting in database
@@ -496,7 +512,6 @@ async function settleRideTransaction(
       return await execute(dbClient as Prisma.TransactionClient);
     }
   } catch (err: unknown) {
-    
     // If concurrent insert failed with unique constraint on transaction_id, resolve as DUPLICATE
     const isUniqueConstraint =
       typeof err === "object" &&
