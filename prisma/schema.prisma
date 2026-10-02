@@ -94,6 +94,7 @@ model User {
 
   @@index([role, isVerified])
   @@map("users")
+  driverCardCredentials DriverCardCredential[]
 }
 
 model Wallet {
@@ -361,4 +362,19 @@ model RefreshToken {
   @@index([token_id])
   @@index([expires_at])
   @@map("refresh_tokens")
+}
+
+model DriverCardCredential {
+  id         String   @id @default(uuid())
+  driver_uid String   @unique @db.VarChar(20)
+  card_uid   String   @unique @db.VarChar(20)
+  pin_hash   String   @db.VarChar(255)
+  created_at DateTime @default(now()) @db.Timestamptz(6)
+  updated_at DateTime @updatedAt @db.Timestamptz(6)
+
+  driver     User     @relation(fields: [driver_uid], references: [matricNumber], onDelete: Cascade)
+
+  @@index([driver_uid])
+  @@index([card_uid])
+  @@map("driver_card_credentials")
 }
