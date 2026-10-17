@@ -14,7 +14,7 @@ import { ingestTransactionBatch } from "../services/ingestion.service.js";
 import { handlePendingLink } from "../services/registration.service.js";
 import { syncFullListsToTerminal } from "../services/sync.service.js";
 import { handleLwtEvent } from "../mqtt/lwtHandler.js";
- 
+
 import logger from "../config/logger.js";
 import type { Logger } from "pino";
 import { publishToTerminal } from "./downlinkQueue.js";
@@ -51,7 +51,6 @@ async function routeUplinkMessage(
   const log = logger.child({ terminalId, topic });
   const rawMessage = payloadBuffer.toString("utf8").trim();
 
-// Very Important: Handle LWT messages first, before any other processing
   if (topic.endsWith("/status")) {
     await handleLwtEvent(terminalId, rawMessage);
     return;
@@ -62,9 +61,18 @@ async function routeUplinkMessage(
     return;
   }
 
-  // Very Important: Split the batch payload into individual lines, and process each line
   const { deviceId, lines } = splitBatchPayload(rawMessage, terminalId);
-  const activeTerminalId = deviceId || terminalId;
+
+  // The topic is the only identity the broker vouches for. A device id written inside
+  // the payload must match it, otherwise one terminal could act as another.
+  if (deviceId !== terminalId) {
+    log.warn(
+      { claimedDeviceId: deviceId },
+      "uplink.device_id_topic_mismatch — discarding"
+    );
+    return;
+  }
+  const activeTerminalId = terminalId;
 
   log.debug(
     { messageCount: lines.length, activeTerminalId },
@@ -145,7 +153,6 @@ async function routeUplinkMessage(
   }
 }
 
-// Very Important: Handle Sync Request messages by triggering a full sync to the terminal
 async function handleSyncRequest(
   terminalId: string,
   data: SyncRequestData,
@@ -163,96 +170,6 @@ async function handleSyncRequest(
   );
   await syncFullListsToTerminal(targetTerminalId);
 }
-
-// async function handleFullSyncRequest(
-//   terminalId: string,
-//   log: ChildLogger
-// ): Promise<void> {
-//   log.info("uplink.full_sync_requested");
-
-//   const MAX_CHUNK_BYTES = 500;
-//   const SYNC_DELAY_MS = 2000;
-//   const sleep = (ms: number) =>
-//     new Promise((resolve) => setTimeout(resolve, ms));
-
-//   try {
-//     // Fetch whitelist — all linked wallets
-//     const cardMappings = await prisma.cardMapping.findMany({
-//       select: { card_uid: true },
-//     });
-
-//     const whitelistUids = cardMappings.map(
-//       (c: { card_uid: string }) => c.card_uid
-//     );
-
-//     // Fetch blacklist — all blacklisted wallets
-//     const blacklistedMappings = await prisma.cardMapping.findMany({
-//       where: {
-//         student_uid: {
-//           in: await prisma.blacklist
-//             .findMany({ select: { student_uid: true } })
-//             .then((bl: { student_uid: string }[]) =>
-//               bl.map((b: { student_uid: string }) => b.student_uid)
-//             ),
-//         },
-//       },
-//       select: { card_uid: true },
-//     });
-
-//     const blacklistUids = blacklistedMappings.map(
-//       (c: { card_uid: string }) => c.card_uid
-//     );
-
-//     log.info(
-//       {
-//         whitelistCount: whitelistUids.length,
-//         blacklistCount: blacklistUids.length,
-//       },
-//       "uplink.full_sync_data_fetched"
-//     );
-
-//     // Publish Whitelist
-//     if (whitelistUids.length === 0) {
-//       await publishToTerminal(terminalId, "SYS:WL,EMPTY");
-//     } else {
-//       const wlChunks = buildChunks("SYS:WL,", whitelistUids, MAX_CHUNK_BYTES);
-//       for (let i = 0; i < wlChunks.length; i++) {
-//         await publishToTerminal(terminalId, wlChunks[i]);
-//         log.debug(
-//           { chunk: i + 1, total: wlChunks.length },
-//           "uplink.wl_chunk_sent"
-//         );
-//         if (i < wlChunks.length - 1) await sleep(SYNC_DELAY_MS);
-//       }
-//     }
-
-//     await sleep(SYNC_DELAY_MS);
-
-//     // Publish Blacklist
-//     if (blacklistUids.length === 0) {
-//       await publishToTerminal(terminalId, "SYS:BL,EMPTY");
-//     } else {
-//       const blChunks = buildChunks("SYS:BL,", blacklistUids, MAX_CHUNK_BYTES);
-//       for (let i = 0; i < blChunks.length; i++) {
-//         await publishToTerminal(terminalId, blChunks[i]);
-//         log.debug(
-//           { chunk: i + 1, total: blChunks.length },
-//           "uplink.bl_chunk_sent"
-//         );
-//         if (i < blChunks.length - 1) await sleep(SYNC_DELAY_MS);
-//       }
-//     }
-
-//     await sleep(SYNC_DELAY_MS);
-
-//     await publishToTerminal(terminalId, "SYS:SYNC_COMPLETE");
-//     log.info("uplink.full_sync_complete");
-//   } catch (error) {
-//     const errMessage = error instanceof Error ? error.message : "Unknown error";
-//     log.error({ err: errMessage }, "uplink.full_sync_error");
-//     throw error;
-//   }
-// }
 
 async function handleDriverEvent(
   terminalId: string,

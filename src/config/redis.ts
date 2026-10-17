@@ -5,12 +5,21 @@ import logger from "./logger.js";
 
 let redisClient: Redis | null = null;
 
+// Host only. The full URL contains the password and must never be logged.
+function redisHost(url: string): string {
+  try {
+    return new URL(url).host;
+  } catch {
+    return "invalid-url";
+  }
+}
+
 function getRedisClient(): Redis {
   if (redisClient) return redisClient;
 
   const redisUrl = env.redis.url;
 
-  logger.info({ redisUrl }, "redis.connecting");
+  logger.info({ redisHost: redisHost(redisUrl) }, "redis.connecting");
   redisClient = new Redis(redisUrl, {
     lazyConnect: false,
     enableOfflineQueue: false,
@@ -24,54 +33,15 @@ function getRedisClient(): Redis {
   return redisClient;
 }
 
-function setRedisClient(client: Redis): void {
-  redisClient = client;
-}
-
-async function waitForRedisReady(client: Redis): Promise<void> {
-  if (client.status === "ready") return;
-
-  await new Promise<void>((resolve, reject) => {
-    const onReady = () => {
-      cleanup();
-      resolve();
-    };
-    const onError = (error: Error) => {
-      cleanup();
-      reject(error);
-    };
-    const cleanup = () => {
-      client.off("ready", onReady);
-      client.off("error", onError);
-    };
-
-    client.once("ready", onReady);
-    client.once("error", onError);
-  });
-}
-
-// MQTT Bridge & Terminal Queue Keys
-// These are the ONLY Redis keys used in the MQTT service.
+// Per-terminal downlink queue: RPUSH queue:8hy1k "ADD:WL,uid"
 const redisKeys = {
-  
-  // Per-terminal downlink queue: RPUSH queue:term_01 "ADD:WL,uid"
   terminalQueue: (terminalId: string): string =>
     `queue:${terminalId.toLowerCase()}`,
 };
 
 const cacheKeys = {
-  // Maps hardware card UID → student matricNumber
-  // Cached with a 7-day TTL; invalidated immediately on card re-link
-  // This is the ONLY cache remaining in the MQTT service
+  // Hardware card UID -> student matricNumber (invalidated on card re-link)
   cardMap: (cardUid: string): string => `card:map:${cardUid}`,
 };
 
-export {
-  getRedisClient,
-  setRedisClient,
-  waitForRedisReady,
-  Redis,
-  redisKeys,
-  cacheKeys,
-};
-
+export { getRedisClient, Redis, redisKeys, cacheKeys };

@@ -1,10 +1,11 @@
+// src/services/sync.service.ts
 "use strict";
 
 import { getRedisClient, redisKeys } from "../config/redis.js";
 import logger from "../config/logger.js";
 import { prisma } from "./ledger.service.js";
 import { buildChunks } from "../utils/parser.js";
-import { publishToTerminal } from "../mqtt/downlinkQueue.js";
+import { publishToTerminal, commandTag } from "../mqtt/downlinkQueue.js";
 
 export type MqttPublishFn = (
   terminalId: string,
@@ -45,14 +46,14 @@ async function enqueueTerminalCommand(
         if (item.startsWith(matchingPrefix)) {
           await redis.lrem(queueKey, 0, item);
           logger.info(
-            { terminalId: normId, staleCommand: item, newCommand: command },
+            { terminalId: normId, command: commandTag(command) },
             "sync.enqueue_replaced_stale_state_command"
           );
         }
       }
     } else if (existing.includes(command)) {
       logger.debug(
-        { terminalId: normId, command },
+        { terminalId: normId, command: commandTag(command) },
         "sync.enqueue_skipped_duplicate — command already queued"
       );
       return false;
@@ -60,14 +61,14 @@ async function enqueueTerminalCommand(
 
     await redis.rpush(queueKey, command);
     logger.info(
-      { terminalId: normId, command },
+      { terminalId: normId, command: commandTag(command) },
       "sync.command_queued_loss_resistant"
     );
     return true;
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : "Unknown error";
     logger.error(
-      { terminalId: normId, command, err: errMsg },
+      { terminalId: normId, command: commandTag(command), err: errMsg },
       "sync.enqueue_command_error"
     );
     throw err;
@@ -80,7 +81,10 @@ async function routeDeltaToTerminal(
 ): Promise<void> {
   const normId = terminalId.toUpperCase();
   const redis = getRedisClient();
-  const log = logger.child({ terminalId: normId, deltaCommand });
+  const log = logger.child({
+    terminalId: normId,
+    command: commandTag(deltaCommand),
+  });
   const queueKey = redisKeys.terminalQueue(normId);
 
   try {
@@ -141,73 +145,71 @@ async function routeDeltaToTerminal(
   }
 }
 
-async function broadcastDeltaToFleet(deltaCommand: string): Promise<void> {
-  const log = logger.child({ deltaCommand });
+export interface BroadcastSummary {
+  totalTerminals: number;
+  deliveredCount: number; // published directly
+  queuedCount: number; // stored in Redis, delivered on reconnect
+  failedTerminals: string[]; // neither published nor queued
+}
+
+async function broadcastDeltaToFleet(deltaCommand: string): Promise<BroadcastSummary> {
+  const log = logger.child({ command: commandTag(deltaCommand) });
   const redis = getRedisClient();
 
-  try {
-    const terminals = await prisma.terminal.findMany({
-      select: { terminal_id: true, status: true },
-    });
+  const terminals = await prisma.terminal.findMany({
+    select: { terminal_id: true, status: true },
+  });
 
-    if (terminals.length === 0) {
-      log.warn("sync.fleet_broadcast_no_terminals");
-      return;
-    }
+  const summary: BroadcastSummary = {
+    totalTerminals: terminals.length,
+    deliveredCount: 0,
+    queuedCount: 0,
+    failedTerminals: [],
+  };
 
-    log.info({ terminalCount: terminals.length }, "sync.fleet_broadcast_start");
+  await Promise.all(
+    terminals.map(async (t: { terminal_id: string; status: string }) => {
+      const id = t.terminal_id.toUpperCase();
+      const online = t.status === "ONLINE" && !!_mqttPublish;
 
-    const promises = terminals.map(
-      async (t: { terminal_id: string; status: string }) => {
-        const targetId = t.terminal_id.toUpperCase();
-        const qLog = log.child({ terminalId: targetId });
-        const queueKey = redisKeys.terminalQueue(targetId);
+      try {
+        const pending = online
+          ? await redis.llen(redisKeys.terminalQueue(id)).catch(() => -1)
+          : -1;
 
-        try {
-          const pendingCount = await redis.llen(queueKey);
-          if (t.status === "ONLINE" && pendingCount === 0 && _mqttPublish) {
-            try {
-              await _mqttPublish(targetId, deltaCommand);
-              qLog.debug("sync.broadcast_published_direct");
-              return;
-            } catch (pubErr) {
-              const errMsg =
-                pubErr instanceof Error ? pubErr.message : "Unknown error";
-              qLog.warn(
-                { err: errMsg },
-                "sync.broadcast_direct_publish_failed — queuing to redis"
-              );
-              await enqueueTerminalCommand(targetId, deltaCommand);
-              return;
-            }
-          }
-
-          await enqueueTerminalCommand(targetId, deltaCommand);
-          qLog.debug("sync.broadcast_queued_redis");
-
-          if (t.status === "ONLINE" && _mqttPublish) {
-            flushTerminalQueue(targetId).catch((err) => {
-              qLog.error({ err }, "sync.broadcast_flush_error");
-            });
-          }
-        } catch (err) {
-          const errMsg = err instanceof Error ? err.message : "Unknown error";
-          qLog.error({ err: errMsg }, "sync.broadcast_routing_failed");
+        if (online && pending === 0) {
           try {
-            await enqueueTerminalCommand(targetId, deltaCommand);
-          } catch {
-            // ignore
+            await _mqttPublish!(id, deltaCommand);
+            summary.deliveredCount++;
+            return;
+          } catch (err) {
+            log.warn(
+              { terminalId: id, err: err instanceof Error ? err.message : String(err) },
+              "sync.broadcast_direct_publish_failed — queuing to redis"
+            );
           }
         }
-      }
-    );
 
-    await Promise.allSettled(promises);
-    log.info("sync.fleet_broadcast_complete");
-  } catch (err) {
-    const errMsg = err instanceof Error ? err.message : "Unknown error";
-    log.error({ err: errMsg }, "sync.fleet_broadcast_error");
-  }
+        await enqueueTerminalCommand(id, deltaCommand);
+        summary.queuedCount++;
+
+        if (online) {
+          flushTerminalQueue(id).catch((err) =>
+            log.error({ terminalId: id, err }, "sync.broadcast_flush_error")
+          );
+        }
+      } catch (err) {
+        log.error(
+          { terminalId: id, err: err instanceof Error ? err.message : String(err) },
+          "sync.broadcast_routing_failed"
+        );
+        summary.failedTerminals.push(id);
+      }
+    })
+  );
+
+  log.info(summary, "sync.fleet_broadcast_complete");
+  return summary;
 }
 
 const activeFlushes = new Set<string>();
@@ -262,12 +264,15 @@ async function flushTerminalQueue(terminalId: string): Promise<void> {
         // Successful publish: atomically pop from the head of the queue exactly once
         await redis.lpop(queueKey);
         flushedCount++;
-        log.debug({ command, flushedCount }, "sync.flush_queue_item_sent");
+        log.debug(
+          { command: commandTag(command), flushedCount },
+          "sync.flush_queue_item_sent"
+        );
       } catch (publishErr) {
         const errMsg =
           publishErr instanceof Error ? publishErr.message : "Unknown error";
         log.error(
-          { command, err: errMsg },
+          { command: commandTag(command), err: errMsg },
           "sync.flush_queue_publish_failed — command preserved in queue for retry"
         );
         // Do NOT pop! The command remains at index 0 in Redis for next retry.
