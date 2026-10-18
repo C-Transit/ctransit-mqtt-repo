@@ -1,339 +1,19 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+// This is your Prisma schema file
+
 generator client {
   provider = "prisma-client-js"
 }
 
 datasource db {
-  provider  = "postgresql"
-  url       = env("DATABASE_URL_POOLED")
-  directUrl = env("DATABASE_URL")
-}
-
-model User {
-  id                     String                  @id @default(uuid())
-  firstname              String
-  lastname               String
-  email                  String                  @unique
-  matricNumber           String                  @unique @db.VarChar(20)
-  password               String
-  role                   Role                    @default(STUDENT)
-  isVerified             Boolean                 @default(false)
-  createdAt              DateTime                @default(now())
-  updatedAt              DateTime                @updatedAt
-  phone                  String?                 @unique @db.VarChar(20)
-  vehicleType            String?                 @db.VarChar(50)
-  vehiclePlate           String?                 @db.VarChar(50)
-  bankName               String?                 @db.VarChar(100)
-  accountNumber          String?                 @db.VarChar(50)
-  bankCode               String?                 @db.VarChar(20)
-  accountName            String?                 @db.VarChar(100)
-  bankVerified           Boolean                 @default(false)
-  admin_card_credentials admin_card_credentials?
-  createdAgents          Agent[]                 @relation("AdminCreatedAgents")
-  resolvedDisputes       Dispute[]               @relation("AdminResolvedDisputes")
-  studentDisputes        Dispute[]               @relation("StudentDisputes")
-  driverCardCredentials  DriverCardCredential?
-  driverWallet           DriverWallet?
-  driverWithdrawals      DriverWithdrawal[]      @relation("DriverWithdrawals")
-  kyc                    Kyc?
-  notifications          Notification[]
-  payment_attempts       payment_attempts[]
-  driverTransactions     Transaction[]           @relation("DriverTransactions")
-  transactions           Transaction[]           @relation("StudentTransactions")
-  wallet                 Wallet?
-
-  @@index([role, isVerified])
-  @@map("users")
-}
-
-model Wallet {
-  id               String   @id @default(uuid())
-  balance          Decimal  @default(0) @db.Decimal(10, 2)
-  is_linked        Boolean  @default(false)
-  created_at       DateTime @default(now()) @db.Timestamptz(6)
-  updated_at       DateTime @updatedAt @db.Timestamptz(6)
-  student_uid      String   @unique @db.VarChar(20)
-  v_account_number String?  @unique @db.VarChar(20)
-  v_bank_name      String?  @db.VarChar(50)
-  user             User     @relation(fields: [student_uid], references: [matricNumber])
-
-  @@index([is_linked])
-  @@map("wallets")
-}
-
-model Terminal {
-  terminal_id       String         @id @db.VarChar(20)
-  last_seen         DateTime?      @db.Timestamptz(6)
-  active_driver_uid String?        @db.VarChar(20)
-  secret_key        String         @db.VarChar(64)
-  status            TerminalStatus @default(OFFLINE)
-  location          String?        @db.VarChar(10)
-  transactions      Transaction[]
-
-  @@index([status])
-  @@index([location])
-  @@map("terminals")
-}
-
-model Transaction {
-  transaction_id  String          @id @db.VarChar(64)
-  terminal_id     String          @db.VarChar(20)
-  student_uid     String          @db.VarChar(20)
-  amount          Decimal         @db.Decimal(10, 2)
-  driver_uid      String?         @db.VarChar(20)
-  synced_at       DateTime        @default(now()) @db.Timestamptz(6)
-  type            TransactionType @default(RIDE)
-  fare            Decimal?        @db.Decimal(10, 2)
-  driver_share    Decimal?        @db.Decimal(10, 2)
-  ctransit_share  Decimal?        @db.Decimal(10, 2)
-  location        String?         @db.VarChar(10)
-  card_uid        String?         @db.VarChar(20)
-  tapped_at       DateTime?       @db.Timestamptz(6)
-  idempotency_key String?         @unique @db.VarChar(64)
-  disputes        Dispute[]
-  driver          User?           @relation("DriverTransactions", fields: [driver_uid], references: [matricNumber])
-  user            User            @relation("StudentTransactions", fields: [student_uid], references: [matricNumber])
-  terminal        Terminal        @relation(fields: [terminal_id], references: [terminal_id])
-
-  @@index([student_uid, synced_at(sort: Desc)])
-  @@index([terminal_id, synced_at(sort: Desc)])
-  @@index([type])
-  @@index([driver_uid, synced_at(sort: Desc)])
-  @@index([location])
-  @@index([card_uid])
-  @@index([tapped_at])
-  @@index([idempotency_key])
-  @@map("transactions")
-}
-
-model DriverWallet {
-  id             String   @id @default(uuid())
-  driver_uid     String   @unique @db.VarChar(20)
-  balance        Decimal  @default(0) @db.Decimal(10, 2)
-  total_earnings Decimal  @default(0) @db.Decimal(10, 2)
-  created_at     DateTime @default(now()) @db.Timestamptz(6)
-  updated_at     DateTime @updatedAt @db.Timestamptz(6)
-  driver         User     @relation(fields: [driver_uid], references: [matricNumber], onDelete: Cascade)
-
-  @@index([driver_uid])
-  @@map("driver_wallets")
-}
-
-model DriverWithdrawal {
-  id             String           @id @default(uuid())
-  driver_uid     String           @db.VarChar(20)
-  amount         Decimal          @db.Decimal(10, 2)
-  bank_name      String           @db.VarChar(100)
-  account_number String           @db.VarChar(50)
-  account_name   String           @db.VarChar(100)
-  remarks        String?          @db.VarChar(255)
-  reference      String           @unique @db.VarChar(64)
-  status         WithdrawalStatus @default(PENDING)
-  created_at     DateTime         @default(now()) @db.Timestamptz(6)
-  updated_at     DateTime         @updatedAt @db.Timestamptz(6)
-  fee            Decimal?         @db.Decimal(10, 2)
-  net_amount     Decimal?         @db.Decimal(10, 2)
-  kora_reference String?          @db.VarChar(100)
-  kora_fee       Decimal?         @db.Decimal(10, 2)
-  failure_reason String?          @db.VarChar(255)
-  driver         User             @relation("DriverWithdrawals", fields: [driver_uid], references: [matricNumber], onDelete: Cascade)
-
-  @@index([driver_uid, created_at(sort: Desc)])
-  @@index([status])
-  @@index([reference])
-  @@index([kora_reference])
-  @@map("driver_withdrawals")
-}
-
-model SystemWallet {
-  id            String   @id @default("CTRANSIT_SYSTEM")
-  name          String   @default("C-Transit Platform")
-  balance       Decimal  @default(0) @db.Decimal(10, 2)
-  total_revenue Decimal  @default(0) @db.Decimal(10, 2)
-  created_at    DateTime @default(now()) @db.Timestamptz(6)
-  updated_at    DateTime @updatedAt @db.Timestamptz(6)
-
-  @@map("system_wallets")
-}
-
-model Kyc {
-  id              String    @id @default(uuid())
-  idCardImageUrl  String
-  status          KycStatus @default(PENDING)
-  rejectionReason String?
-  submittedAt     DateTime  @default(now())
-  reviewedAt      DateTime?
-  userId          String    @unique
-  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
-
-  @@index([status])
-  @@index([status, submittedAt])
-  @@map("kyc_records")
-}
-
-model Blacklist {
-  id            String   @id @default(uuid())
-  student_uid   String   @unique @db.VarChar(20)
-  reason        String   @default("LOW_BALANCE")
-  blacklistedAt DateTime @default(now())
-
-  @@index([blacklistedAt(sort: Desc)])
-  @@map("blacklist")
-}
-
-model CardMapping {
-  id          String   @id @default(uuid())
-  card_uid    String   @unique @db.VarChar(20)
-  student_uid String   @unique @db.VarChar(20)
-  linked_at   DateTime @default(now())
-
-  @@index([linked_at(sort: Desc)])
-  @@map("card_mappings")
-}
-
-model Agent {
-  id               String      @id @default(uuid())
-  firstname        String
-  lastname         String
-  email            String      @unique
-  phone            String      @db.VarChar(15)
-  password         String
-  status           AgentStatus @default(ACTIVE)
-  createdAt        DateTime    @default(now())
-  updatedAt        DateTime    @updatedAt
-  createdBy        String
-  creator          User        @relation("AdminCreatedAgents", fields: [createdBy], references: [id])
-  resolvedDisputes Dispute[]   @relation("AgentResolvedDisputes")
-
-  @@index([status])
-  @@index([createdBy, status])
-  @@map("agents")
-}
-
-model Notification {
-  id          String   @id @default(uuid())
-  title       String
-  body        String
-  isRead      Boolean  @default(false)
-  createdAt   DateTime @default(now())
-  student_uid String   @db.VarChar(20)
-  user        User     @relation(fields: [student_uid], references: [matricNumber], onDelete: Cascade)
-
-  @@index([student_uid, createdAt(sort: Desc)])
-  @@index([student_uid, isRead])
-  @@map("notifications")
-}
-
-model Dispute {
-  id              String        @id @default(uuid())
-  description     String
-  status          DisputeStatus @default(OPEN)
-  resolution      String?
-  resolvedAt      DateTime?
-  createdAt       DateTime      @default(now())
-  updatedAt       DateTime      @updatedAt
-  student_uid     String        @db.VarChar(20)
-  transaction_id  String        @db.VarChar(64)
-  resolvedByAgent String?
-  resolvedByAdmin String?
-  admin           User?         @relation("AdminResolvedDisputes", fields: [resolvedByAdmin], references: [id])
-  agent           Agent?        @relation("AgentResolvedDisputes", fields: [resolvedByAgent], references: [id])
-  user            User          @relation("StudentDisputes", fields: [student_uid], references: [matricNumber], onDelete: Cascade)
-  transaction     Transaction   @relation(fields: [transaction_id], references: [transaction_id])
-
-  @@index([status, createdAt])
-  @@index([student_uid, createdAt(sort: Desc)])
-  @@index([transaction_id])
-  @@map("disputes")
-}
-
-model RegistrationOtp {
-  id          String   @id @default(uuid())
-  otp         String   @unique
-  card_uid    String   @db.VarChar(20)
-  terminal_id String   @db.VarChar(20)
-  expires_at  DateTime
-  used        Boolean  @default(false)
-  created_at  DateTime @default(now())
-  agent_uid   String?  @db.VarChar(36)
-
-  @@index([otp])
-  @@index([expires_at])
-  @@index([agent_uid])
-  @@map("registration_otps")
-}
-
-model FareConfig {
-  id            String   @id @default(uuid())
-  code          String   @unique @db.VarChar(10)
-  location_name String   @db.VarChar(50)
-  amount        Decimal  @db.Decimal(10, 2)
-  updated_by    String?  @db.VarChar(50)
-  created_at    DateTime @default(now()) @db.Timestamptz(6)
-  updated_at    DateTime @updatedAt @db.Timestamptz(6)
-
-  @@map("fare_configs")
-}
-
-model RefreshToken {
-  id         String   @id @default(uuid())
-  token_id   String   @unique
-  user_id    String
-  role       String
-  email      String
-  expires_at DateTime
-  revoked    Boolean  @default(false)
-  created_at DateTime @default(now())
-
-  @@index([token_id])
-  @@index([expires_at])
-  @@map("refresh_tokens")
-}
-
-model DriverCardCredential {
-  id         String   @id @default(uuid())
-  driver_uid String   @unique @db.VarChar(20)
-  card_uid   String   @unique @db.VarChar(20)
-  pin_hash   String   @db.VarChar(255)
-  created_at DateTime @default(now()) @db.Timestamptz(6)
-  updated_at DateTime @updatedAt @db.Timestamptz(6)
-  driver     User     @relation(fields: [driver_uid], references: [matricNumber], onDelete: Cascade)
-
-  @@index([driver_uid])
-  @@index([card_uid])
-  @@map("driver_card_credentials")
-}
-
-model admin_card_credentials {
-  id         String   @id
-  admin_uid  String   @unique @db.VarChar(20)
-  card_uid   String   @unique @db.VarChar(20)
-  pin_hash   String   @db.VarChar(255)
-  created_at DateTime @default(now()) @db.Timestamptz(6)
-  updated_at DateTime @db.Timestamptz(6)
-  users      User     @relation(fields: [admin_uid], references: [matricNumber], onDelete: Cascade)
-
-  @@index([admin_uid])
-  @@index([card_uid])
-}
-
-model payment_attempts {
-  id                String               @id
-  reference         String               @unique @db.VarChar(64)
-  provider          String               @db.VarChar(20)
-  providerReference String?              @db.VarChar(100)
-  userId            String
-  amount            Decimal              @db.Decimal(10, 2)
-  currency          String               @db.VarChar(3)
-  status            PaymentAttemptStatus @default(PENDING)
-  failureReason     String?
-  createdAt         DateTime             @default(now())
-  updatedAt         DateTime
-  completedAt       DateTime?
-  users             User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
-
-  @@index([providerReference])
-  @@index([status])
-  @@index([userId, createdAt(sort: Desc)])
+  provider = "postgresql"
+  url      = env("DATABASE_URL_POOLED") // Use fully for runtime
+  directUrl = env("DATABASE_URL") // Use for migrations only
 }
 
 enum Role {
@@ -361,12 +41,14 @@ enum TerminalStatus {
   LOCKED
 }
 
+// Agent account lifecycle — SUSPENDED = temporary, DEACTIVATED = permanent
 enum AgentStatus {
   ACTIVE
   SUSPENDED
   DEACTIVATED
 }
 
+// Dispute lifecycle — UNDER_REVIEW means an agent/admin has picked it up
 enum DisputeStatus {
   OPEN
   UNDER_REVIEW
@@ -388,4 +70,356 @@ enum PaymentAttemptStatus {
   FAILED
   CANCELLED
   EXPIRED
+}
+
+model User {
+  id           String   @id @default(uuid())
+  firstname    String
+  lastname     String
+  email        String   @unique
+  matricNumber String   @unique @db.VarChar(20)
+  password     String
+  role         Role     @default(STUDENT)
+  isVerified   Boolean  @default(false)
+  phone        String?  @unique @db.VarChar(20)
+  vehicleType  String?  @db.VarChar(50)
+  vehiclePlate String?  @db.VarChar(50)
+  bankCode     String?  @db.VarChar(20)
+  bankName     String?  @db.VarChar(100)
+  accountNumber String? @db.VarChar(50)
+  accountName  String?  @db.VarChar(100)
+  bankVerified Boolean  @default(false)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  wallet            Wallet?
+  driverWallet      DriverWallet?
+  driverCredential  DriverCardCredential?
+  adminCredential   AdminCardCredential?
+  transactions      Transaction[]      @relation("StudentTransactions")
+  driverTransactions Transaction[]     @relation("DriverTransactions")
+  driverWithdrawals DriverWithdrawal[] @relation("DriverWithdrawals")
+  paymentAttempts  PaymentAttempt[]
+  kyc               Kyc?
+
+  createdAgents     Agent[]        @relation("AdminCreatedAgents")
+  notifications     Notification[]
+  studentDisputes   Dispute[]      @relation("StudentDisputes")
+  resolvedDisputes  Dispute[]      @relation("AdminResolvedDisputes")
+
+  @@index([role, isVerified])
+  @@map("users")
+}
+
+model Wallet {
+  id               String   @id @default(uuid())
+  balance          Decimal  @default(0) @db.Decimal(10, 2)
+  is_linked        Boolean  @default(false)
+  v_account_number String?  @unique @db.VarChar(20)
+  v_bank_name      String?  @db.VarChar(50)     
+  created_at       DateTime @default(now()) @db.Timestamptz(6)
+  updated_at       DateTime @updatedAt @db.Timestamptz(6)
+
+  student_uid String @unique @db.VarChar(20)
+  user        User   @relation(fields: [student_uid], references: [matricNumber])
+
+  @@index([is_linked])
+  @@map("wallets")
+}
+
+model Terminal {
+  terminal_id       String         @id @db.VarChar(20)
+  status            TerminalStatus @default(OFFLINE)
+  last_seen         DateTime?      @db.Timestamptz(6)
+  active_driver_uid String?        @db.VarChar(20)
+  secret_key        String         @db.VarChar(64)
+  location          String?        @db.VarChar(10)
+
+  transactions Transaction[]
+
+  @@index([status])
+  @@index([location])
+
+  @@map("terminals")
+}
+
+model Transaction {
+  transaction_id   String          @id @db.VarChar(64)
+  type             TransactionType @default(RIDE)
+  terminal_id      String          @db.VarChar(20)
+  student_uid      String          @db.VarChar(20)
+  card_uid         String?         @db.VarChar(20)
+  location         String?         @db.VarChar(10)
+  amount           Decimal         @db.Decimal(10, 2)
+  fare             Decimal?        @db.Decimal(10, 2)
+  driver_share     Decimal?        @db.Decimal(10, 2)
+  ctransit_share   Decimal?        @db.Decimal(10, 2)
+  driver_uid       String?         @db.VarChar(20)
+  tapped_at        DateTime?       @db.Timestamptz(6)
+  synced_at        DateTime        @default(now()) @db.Timestamptz(6)
+  idempotency_key  String?         @unique @db.VarChar(64)
+
+  user             User     @relation("StudentTransactions", fields: [student_uid], references: [matricNumber])
+  driver           User?    @relation("DriverTransactions", fields: [driver_uid], references: [matricNumber])
+  terminal         Terminal @relation(fields: [terminal_id], references: [terminal_id])
+  disputes         Dispute[]
+
+  @@index([student_uid, synced_at(sort: Desc)])
+  @@index([terminal_id, synced_at(sort: Desc)])
+  @@index([type])
+  @@index([driver_uid, synced_at(sort: Desc)])
+  @@index([location])
+  @@index([card_uid])
+  @@index([tapped_at])
+
+  @@map("transactions")
+}
+
+model DriverWallet {
+  id             String   @id @default(uuid())
+  driver_uid     String   @unique @db.VarChar(20)
+  balance        Decimal  @default(0) @db.Decimal(10, 2)
+  total_earnings Decimal  @default(0) @db.Decimal(10, 2)
+  created_at     DateTime @default(now()) @db.Timestamptz(6)
+  updated_at     DateTime @updatedAt @db.Timestamptz(6)
+
+  driver         User     @relation(fields: [driver_uid], references: [matricNumber], onDelete: Cascade)
+
+  @@map("driver_wallets")
+}
+
+model DriverWithdrawal {
+  id             String           @id @default(uuid())
+  driver_uid     String           @db.VarChar(20)
+  amount         Decimal          @db.Decimal(10, 2)
+  fee            Decimal?         @db.Decimal(10, 2)
+  net_amount     Decimal?         @db.Decimal(10, 2)
+  bank_name      String           @db.VarChar(100)
+  account_number String           @db.VarChar(50)
+  account_name   String           @db.VarChar(100)
+  remarks        String?          @db.VarChar(255)
+  reference      String           @unique @db.VarChar(64)
+  kora_reference String?          @db.VarChar(100)
+  kora_fee       Decimal?         @db.Decimal(10, 2)
+  failure_reason String?          @db.VarChar(255)
+  status         WithdrawalStatus @default(PENDING)
+  created_at     DateTime         @default(now()) @db.Timestamptz(6)
+  updated_at     DateTime         @updatedAt @db.Timestamptz(6)
+
+  driver         User             @relation("DriverWithdrawals", fields: [driver_uid], references: [matricNumber], onDelete: Cascade)
+
+  @@index([driver_uid, created_at(sort: Desc)])
+  @@index([status])
+  @@index([kora_reference])
+  @@map("driver_withdrawals")
+}
+
+model PaymentAttempt {
+  id                String              @id @default(uuid())
+  reference         String              @unique @db.VarChar(64)
+  provider          String              @db.VarChar(20)
+  providerReference String?             @db.VarChar(100)
+  userId            String
+  amount            Decimal             @db.Decimal(10, 2)
+  currency          String              @db.VarChar(3)
+  status            PaymentAttemptStatus @default(PENDING)
+  failureReason     String?
+  createdAt         DateTime            @default(now())
+  updatedAt         DateTime            @updatedAt
+  completedAt       DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([status])
+  @@index([providerReference])
+  @@map("payment_attempts")
+}
+
+model SystemWallet {
+  id            String   @id @default("CTRANSIT_SYSTEM")
+  name          String   @default("C-Transit Platform")
+  balance       Decimal  @default(0) @db.Decimal(10, 2)
+  total_revenue Decimal  @default(0) @db.Decimal(10, 2)
+  created_at    DateTime @default(now()) @db.Timestamptz(6)
+  updated_at    DateTime @updatedAt @db.Timestamptz(6)
+
+  @@map("system_wallets")
+}
+
+model Kyc {
+  id             String    @id @default(uuid())
+  idCardImageUrl String
+  status         KycStatus @default(PENDING)
+  rejectionReason String?
+  submittedAt    DateTime  @default(now())
+  reviewedAt     DateTime?
+
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([status, submittedAt(sort: Asc)])
+
+  @@map("kyc_records")
+}
+
+model Blacklist {
+  id            String   @id @default(uuid())
+  student_uid   String   @unique @db.VarChar(20) 
+  reason        String   @default("LOW_BALANCE")
+  blacklistedAt DateTime @default(now())
+
+  @@index([blacklistedAt(sort: Desc)])
+
+  @@map("blacklist")
+}
+
+model CardMapping {
+  id          String   @id @default(uuid())
+  card_uid    String   @unique @db.VarChar(20)
+  student_uid String   @unique @db.VarChar(20)
+  linked_at   DateTime @default(now())
+
+  @@index([linked_at(sort: Desc)])
+
+  @@map("card_mappings")
+}
+
+model DriverCardCredential {
+  id          String   @id @default(uuid())
+  driver_uid  String   @unique @db.VarChar(20)
+  card_uid    String   @unique @db.VarChar(20)
+  pin_hash    String   @db.VarChar(255)
+  created_at  DateTime @default(now()) @db.Timestamptz(6)
+  updated_at  DateTime @updatedAt @db.Timestamptz(6)
+
+  driver      User     @relation(fields: [driver_uid], references: [matricNumber], onDelete: Cascade)
+
+  @@map("driver_card_credentials")
+}
+
+// Mirrors DriverCardCredential — admin's physical card UID + hashed terminal
+// login PIN, used to provision the terminal's AD (admin) list via
+// ADD:AD,{uid},{pin}. Linked via the DB directly for now (no self-service
+// admin flow yet).
+model AdminCardCredential {
+  id          String   @id @default(uuid())
+  admin_uid   String   @unique @db.VarChar(20)
+  card_uid    String   @unique @db.VarChar(20)
+  pin_hash    String   @db.VarChar(255)
+  created_at  DateTime @default(now()) @db.Timestamptz(6)
+  updated_at  DateTime @updatedAt @db.Timestamptz(6)
+
+  admin       User     @relation(fields: [admin_uid], references: [matricNumber], onDelete: Cascade)
+
+  @@map("admin_card_credentials")
+}
+
+model Agent {
+  id        String      @id @default(uuid())
+  firstname String
+  lastname  String
+  email     String      @unique
+  phone     String      @db.VarChar(15)
+  password  String     
+  status    AgentStatus @default(ACTIVE)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  createdBy String
+  creator   User    @relation("AdminCreatedAgents", fields: [createdBy], references: [id])
+  resolvedDisputes Dispute[] @relation("AgentResolvedDisputes")
+
+  @@index([status])
+  @@index([createdBy, status])
+
+  @@map("agents")
+}
+
+model Notification {
+  id        String   @id @default(uuid())
+  title     String
+  body      String
+  isRead    Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  student_uid String @db.VarChar(20)
+  user        User   @relation(fields: [student_uid], references: [matricNumber], onDelete: Cascade)
+
+ 
+  @@index([student_uid, createdAt(sort: Desc)])
+  @@index([student_uid, isRead])
+
+  @@map("notifications")
+}
+
+model Dispute {
+  id          String        @id @default(uuid())
+  description String        
+  status      DisputeStatus @default(OPEN)
+  resolution  String?      
+  resolvedAt  DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  student_uid String @db.VarChar(20)
+  user        User   @relation("StudentDisputes", fields: [student_uid], references: [matricNumber], onDelete: Cascade)
+
+  transaction_id String      @db.VarChar(64)
+  transaction    Transaction @relation(fields: [transaction_id], references: [transaction_id])
+
+  resolvedByAgent String?
+  agent           Agent? @relation("AgentResolvedDisputes", fields: [resolvedByAgent], references: [id])
+
+  resolvedByAdmin String?
+  admin           User?  @relation("AdminResolvedDisputes", fields: [resolvedByAdmin], references: [id])
+
+  @@index([status, createdAt(sort: Asc)])
+  @@index([student_uid, createdAt(sort: Desc)])
+  @@index([transaction_id])
+
+  @@map("disputes")
+}
+
+model RegistrationOtp {
+  id          String   @id @default(uuid())
+  otp         String   @unique
+  card_uid    String   @db.VarChar(20)
+  terminal_id String   @db.VarChar(20)
+  agent_uid   String?  @db.VarChar(36)
+  expires_at  DateTime
+  used        Boolean  @default(false)
+  created_at  DateTime @default(now())
+
+  @@index([expires_at])
+  @@index([agent_uid])
+  @@map("registration_otps")
+}
+
+model FareConfig {
+  id            String   @id @default(uuid())
+  code          String   @unique @db.VarChar(10)
+  location_name String   @db.VarChar(50)
+  amount        Decimal  @db.Decimal(10, 2)
+  updated_by    String?  @db.VarChar(50)
+  created_at    DateTime @default(now()) @db.Timestamptz(6)
+  updated_at    DateTime @updatedAt @db.Timestamptz(6)
+
+  @@map("fare_configs")
+}
+
+model RefreshToken {
+  id         String   @id @default(uuid())
+  token_id   String   @unique
+  user_id    String
+  role       String
+  email      String
+  expires_at DateTime
+  revoked    Boolean  @default(false)
+  created_at DateTime @default(now())
+
+  @@index([expires_at])
+  @@map("refresh_tokens")
 }
