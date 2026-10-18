@@ -1,6 +1,7 @@
 "use strict";
 
-import { activateWallet, prisma } from "./ledger.service.js";
+import { activateWallet } from "./ledger.service.js";
+import prisma from "../lib/prisma.js";
 import { buildDeltaCommand, type PendingLinkData } from "../utils/parser.js";
 import { routeDeltaToTerminal } from "./sync.service.js";
 import { publishToTerminal } from "../mqtt/downlinkQueue.js";

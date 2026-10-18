@@ -323,6 +323,4 @@ async function settleRideTransaction(
   }
 }
 
-// `prisma` is re-exported only until driver.service, registration.service and
-// sync.service import it from ../lib/prisma.js directly (Step 4).
-export { settleRideTransaction, isBelowThreshold, activateWallet, prisma };
+export { settleRideTransaction, isBelowThreshold, activateWallet };

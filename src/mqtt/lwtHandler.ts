@@ -1,4 +1,4 @@
-import { prisma } from "../services/ledger.service.js";
+import prisma from "../lib/prisma.js";
 import { flushTerminalQueue } from "../services/sync.service.js";
 import logger from "../config/logger.js";
 

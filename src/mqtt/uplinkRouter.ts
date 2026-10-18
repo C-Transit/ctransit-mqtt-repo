@@ -1,3 +1,4 @@
+// src/mqtt/uplinkRouter.ts
 import {
   PAYLOAD_TYPE,
   detectPayloadType,
@@ -25,6 +26,9 @@ import {
 } from "../services/driver.service.js";
 
 type ChildLogger = Logger;
+
+const errText = (err: unknown): string =>
+  err instanceof Error ? err.message : "Unknown error";
 
 function extractTerminalId(topic: string): string | null {
   const parts = topic.split("/");
@@ -72,84 +76,91 @@ async function routeUplinkMessage(
     );
     return;
   }
-  const activeTerminalId = terminalId;
 
-  log.debug(
-    { messageCount: lines.length, activeTerminalId },
-    "uplink.batch_split_complete"
-  );
+  log.debug({ messageCount: lines.length }, "uplink.batch_split_complete");
 
+  // Each line is handled on its own: one failing line must not drop the rest.
   for (const line of lines) {
-    const payloadType = detectPayloadType(line);
-    log.debug(
-      { payloadType, lineLength: line.length },
-      "uplink.message_received"
-    );
-
-    switch (payloadType) {
-      case PAYLOAD_TYPE.TRANSACTION_BATCH:
-        await ingestTransactionBatch(activeTerminalId, line);
-        break;
-
-      case PAYLOAD_TYPE.PENDING_LINK: {
-        const { data, error } = parsePendingLink(line, activeTerminalId);
-        if (error) {
-          log.warn({ error, line }, "uplink.pending_link_parse_error — discarding");
-          break;
-        }
-        if (data) {
-          await handlePendingLink(activeTerminalId, data);
-        }
-        break;
-      }
-
-      case PAYLOAD_TYPE.SYNC_REQUEST: {
-        const { data, error } = parseSyncRequest(line, activeTerminalId);
-        if (error) {
-          log.warn({ error, line }, "uplink.sync_request_parse_error — discarding");
-          break;
-        }
-        if (data) {
-          await handleSyncRequest(activeTerminalId, data, log);
-        }
-        break;
-      }
-
-      case PAYLOAD_TYPE.SYS_FULL_SYNC:
-        await syncFullListsToTerminal(activeTerminalId);
-        break;
-
-      case PAYLOAD_TYPE.DRIVER_EVENT: {
-        const { data, error } = parseDriverEvent(line);
-        if (error) {
-          log.warn({ error, line }, "uplink.driver_event_parse_error — discarding");
-          break;
-        }
-        if (data) {
-          await handleDriverEvent(activeTerminalId, data, log);
-        }
-        break;
-      }
-
-      case PAYLOAD_TYPE.DRIVER_REGISTER: {
-        const { data, error } = parseDriverRegister(line);
-        if (error) {
-          log.warn({ error, line }, "uplink.driver_register_parse_error — discarding");
-          break;
-        }
-        if (data) {
-          await handleDriverRegisterEvent(activeTerminalId, data, log);
-        }
-        break;
-      }
-
-      default:
-        log.warn(
-          { rawPayload: line.substring(0, 80) },
-          "uplink.unknown_payload_type"
-        );
-        break;
+    try {
+      await handleLine(terminalId, line, log);
+    } catch (err) {
+      log.error({ err: errText(err) }, "uplink.line_processing_failed");
     }
+  }
+}
+
+async function handleLine(
+  terminalId: string,
+  line: string,
+  log: ChildLogger
+): Promise<void> {
+  const payloadType = detectPayloadType(line);
+  log.debug({ payloadType, lineLength: line.length }, "uplink.message_received");
+
+  switch (payloadType) {
+    case PAYLOAD_TYPE.TRANSACTION_BATCH:
+      await ingestTransactionBatch(terminalId, line);
+      break;
+
+    case PAYLOAD_TYPE.PENDING_LINK: {
+      const { data, error } = parsePendingLink(line, terminalId);
+      if (error) {
+        log.warn({ error }, "uplink.pending_link_parse_error — discarding");
+        break;
+      }
+      if (data) {
+        if (data.device_id && data.device_id.toUpperCase() !== terminalId) {
+          log.warn("uplink.pending_link_device_mismatch — discarding");
+          break;
+        }
+        await handlePendingLink(terminalId, data);
+      }
+      break;
+    }
+
+    case PAYLOAD_TYPE.SYNC_REQUEST: {
+      const { data, error } = parseSyncRequest(line, terminalId);
+      if (error) {
+        log.warn({ error }, "uplink.sync_request_parse_error — discarding");
+        break;
+      }
+      if (data) {
+        await handleSyncRequest(terminalId, data, log);
+      }
+      break;
+    }
+
+    case PAYLOAD_TYPE.SYS_FULL_SYNC:
+      await syncFullListsToTerminal(terminalId);
+      break;
+
+    case PAYLOAD_TYPE.DRIVER_EVENT: {
+      const { data, error } = parseDriverEvent(line);
+      if (error) {
+        log.warn({ error }, "uplink.driver_event_parse_error — discarding");
+        break;
+      }
+      if (data) {
+        await handleDriverEvent(terminalId, data, log);
+      }
+      break;
+    }
+
+    case PAYLOAD_TYPE.DRIVER_REGISTER: {
+      const { data, error } = parseDriverRegister(line);
+      if (error) {
+        log.warn({ error }, "uplink.driver_register_parse_error — discarding");
+        break;
+      }
+      if (data) {
+        await handleDriverRegisterEvent(terminalId, data, log);
+      }
+      break;
+    }
+
+    default:
+      log.warn({ lineLength: line.length }, "uplink.unknown_payload_type");
+      break;
   }
 }
 
@@ -158,17 +169,17 @@ async function handleSyncRequest(
   data: SyncRequestData,
   log: ChildLogger
 ): Promise<void> {
-  const targetTerminalId = data.device_id || terminalId;
+  // A terminal can only ask for its own sync.
+  if (data.device_id && data.device_id.toUpperCase() !== terminalId) {
+    log.warn("uplink.sync_request_device_mismatch — discarding");
+    return;
+  }
+
   log.info(
-    {
-      terminalId: targetTerminalId,
-      timestamp: data.timestamp,
-      driver_uid: data.driver_uid,
-      location: data.location,
-    },
+    { timestamp: data.timestamp, location: data.location },
     "uplink.sync_request_received"
   );
-  await syncFullListsToTerminal(targetTerminalId);
+  await syncFullListsToTerminal(terminalId);
 }
 
 async function handleDriverEvent(

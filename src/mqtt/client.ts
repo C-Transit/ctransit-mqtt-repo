@@ -4,8 +4,7 @@ import mqttConfig from "../config/mqtt.js";
 import logger from "../config/logger.js";
 import env from "../config/env.js";
 import { routeUplinkMessage } from "./uplinkRouter.js";
-import { injectClient, publishToTerminal } from "./downlinkQueue.js";
-import { injectMqttPublisher } from "../services/sync.service.js";
+import { injectClient } from "./downlinkQueue.js";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let client: any = null;
@@ -42,7 +41,6 @@ function connectMqtt(): Promise<any> {
 
       if (client) {
         injectClient(client);
-        injectMqttPublisher(publishToTerminal);
       }
 
       const topics: Record<string, { qos: number }> = {

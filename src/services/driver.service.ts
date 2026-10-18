@@ -1,6 +1,6 @@
 "use strict";
 
-import { prisma } from "./ledger.service.js";
+import prisma from "../lib/prisma.js";
 import bcrypt from "bcryptjs";
 import logger from "../config/logger.js";
 

@@ -34,16 +34,14 @@ const isProduction = process.env.NODE_ENV === "production";
 const missing = REQUIRED_VARS.filter((key) => !process.env[key]);
 
 if (missing.length > 0) {
-  if (isProduction) {
-    process.stderr.write(
-      JSON.stringify({
-        level: "fatal",
-        msg: "Missing required environment variables. Halting.",
-        missing,
-      }) + "\n"
-    );
-    process.exit(1);
-  }
+  process.stderr.write(
+    JSON.stringify({
+      level: "fatal",
+      msg: "Missing required environment variables. Halting.",
+      missing,
+    }) + "\n"
+  );
+  process.exit(1);
 }
 
 // In production, prohibit development fallback/default secrets

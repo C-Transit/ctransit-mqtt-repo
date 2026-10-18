@@ -3,19 +3,27 @@
 
 import { getRedisClient, redisKeys } from "../config/redis.js";
 import logger from "../config/logger.js";
-import { prisma } from "./ledger.service.js";
+import prisma from "../lib/prisma.js";
 import { buildChunks } from "../utils/parser.js";
 import { publishToTerminal, commandTag } from "../mqtt/downlinkQueue.js";
 
-export type MqttPublishFn = (
-  terminalId: string,
-  message: string
-) => Promise<void>;
+// Commands that describe a single current setting: only the newest one matters.
+const STATE_PREFIXES = [
+  "SYS:LOC,",
+  "SYS:FARE,",
+  "SYS:FARE_A,",
+  "SYS:FARE_B,",
+  "SYS:FARE_C,",
+  "SYS:OTA,",
+];
 
-let _mqttPublish: MqttPublishFn | null = null;
+// "ADD:BL,uid" / "REM:BL,uid" / "ADD:DR,uid,pin" -> "BL:uid" / "DR:uid".
+// Two commands with the same key are about the same card, so the newest one wins.
+const DELTA_PATTERN = /^(ADD|REM):([A-Z]+),([^,|]+)/;
 
-function injectMqttPublisher(publishFn: MqttPublishFn): void {
-  _mqttPublish = publishFn;
+function deltaKey(command: string): string | null {
+  const match = DELTA_PATTERN.exec(command);
+  return match ? `${match[2]}:${match[3]}` : null;
 }
 
 async function enqueueTerminalCommand(
@@ -25,56 +33,63 @@ async function enqueueTerminalCommand(
   const normId = terminalId.toUpperCase();
   const redis = getRedisClient();
   const queueKey = redisKeys.terminalQueue(normId);
+  const tag = commandTag(command);
 
   try {
     const existing = await redis.lrange(queueKey, 0, -1);
+    const multi = redis.multi();
+    let replaced = 0;
 
-    // New System state command update
-    // SYS:OTA - is a controlled command
-    const statePrefixes = [
-      "SYS:LOC,",
-      "SYS:FARE,",
-      "SYS:FARE_A,",
-      "SYS:FARE_B,",
-      "SYS:FARE_C,",
-      "SYS:OTA,",
-    ];
-    const matchingPrefix = statePrefixes.find((p) => command.startsWith(p));
+    const matchingPrefix = STATE_PREFIXES.find((p) => command.startsWith(p));
+    const newKey = deltaKey(command);
 
     if (matchingPrefix) {
       for (const item of existing) {
         if (item.startsWith(matchingPrefix)) {
-          await redis.lrem(queueKey, 0, item);
-          logger.info(
-            { terminalId: normId, command: commandTag(command) },
-            "sync.enqueue_replaced_stale_state_command"
-          );
+          multi.lrem(queueKey, 0, item);
+          replaced++;
+        }
+      }
+    } else if (newKey) {
+      // Last writer wins: drop older commands about the same card, then add the new one.
+      for (const item of existing) {
+        if (deltaKey(item) === newKey) {
+          multi.lrem(queueKey, 0, item);
+          replaced++;
         }
       }
     } else if (existing.includes(command)) {
       logger.debug(
-        { terminalId: normId, command: commandTag(command) },
+        { terminalId: normId, command: tag },
         "sync.enqueue_skipped_duplicate — command already queued"
       );
       return false;
     }
 
-    await redis.rpush(queueKey, command);
+    multi.rpush(queueKey, command);
+    const results = await multi.exec();
+    const failed = results?.find(([err]) => err);
+    if (!results || failed) {
+      throw failed?.[0] ?? new Error("REDIS_MULTI_FAILED");
+    }
+
     logger.info(
-      { terminalId: normId, command: commandTag(command) },
+      { terminalId: normId, command: tag, replaced },
       "sync.command_queued_loss_resistant"
     );
     return true;
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : "Unknown error";
     logger.error(
-      { terminalId: normId, command: commandTag(command), err: errMsg },
+      { terminalId: normId, command: tag, err: errMsg },
       "sync.enqueue_command_error"
     );
     throw err;
   }
 }
 
+// Sends a command now if the terminal is online with nothing waiting, otherwise queues it.
+// Throws only if the command could neither be sent nor saved.
 async function routeDeltaToTerminal(
   terminalId: string,
   deltaCommand: string
@@ -101,10 +116,10 @@ async function routeDeltaToTerminal(
 
     const pendingCount = await redis.llen(queueKey);
 
-    // If terminal is marked ONLINE, has no queued backlog, and MQTT publisher is ready:
-    if (terminal.status === "ONLINE" && pendingCount === 0 && _mqttPublish) {
+    // Online and nothing waiting: send straight away.
+    if (terminal.status === "ONLINE" && pendingCount === 0) {
       try {
-        await _mqttPublish(normId, deltaCommand);
+        await publishToTerminal(normId, deltaCommand);
         log.info("sync.delta_published_direct");
         return;
       } catch (pubErr) {
@@ -119,15 +134,14 @@ async function routeDeltaToTerminal(
       }
     }
 
-    // Terminal is OFFLINE, publisher missing, or has existing backlog to preserve FIFO:
+    // Offline, or older commands are waiting: queue it to keep the order.
     await enqueueTerminalCommand(normId, deltaCommand);
     log.info(
       { terminalStatus: terminal.status, pendingCount },
       "sync.delta_queued_redis"
     );
 
-    // If terminal is marked ONLINE and publisher ready, trigger queue flush
-    if (terminal.status === "ONLINE" && _mqttPublish) {
+    if (terminal.status === "ONLINE") {
       flushTerminalQueue(normId).catch((flushErr) => {
         log.error({ err: flushErr }, "sync.flush_queue_trigger_error");
       });
@@ -135,13 +149,9 @@ async function routeDeltaToTerminal(
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : "Unknown error";
     log.error({ err: errMsg }, "sync.route_delta_error — queuing as fallback");
-    try {
-      await enqueueTerminalCommand(normId, deltaCommand);
-    } catch (redisErr) {
-      const redisErrMsg =
-        redisErr instanceof Error ? redisErr.message : "Unknown error";
-      log.error({ err: redisErrMsg }, "sync.redis_fallback_queue_failed");
-    }
+    // If Redis is also down this throws, so the caller learns the command was
+    // neither sent nor saved.
+    await enqueueTerminalCommand(normId, deltaCommand);
   }
 }
 
@@ -170,7 +180,7 @@ async function broadcastDeltaToFleet(deltaCommand: string): Promise<BroadcastSum
   await Promise.all(
     terminals.map(async (t: { terminal_id: string; status: string }) => {
       const id = t.terminal_id.toUpperCase();
-      const online = t.status === "ONLINE" && !!_mqttPublish;
+      const online = t.status === "ONLINE";
 
       try {
         const pending = online
@@ -179,7 +189,7 @@ async function broadcastDeltaToFleet(deltaCommand: string): Promise<BroadcastSum
 
         if (online && pending === 0) {
           try {
-            await _mqttPublish!(id, deltaCommand);
+            await publishToTerminal(id, deltaCommand);
             summary.deliveredCount++;
             return;
           } catch (err) {
@@ -227,13 +237,6 @@ async function flushTerminalQueue(terminalId: string): Promise<void> {
 
   const redis = getRedisClient();
   const log = logger.child({ terminalId: normId });
-
-  if (!_mqttPublish) {
-    log.error("sync.flush_queue_no_mqtt_publisher");
-    activeFlushes.delete(normId);
-    return;
-  }
-
   const queueKey = redisKeys.terminalQueue(normId);
 
   try {
@@ -247,22 +250,20 @@ async function flushTerminalQueue(terminalId: string): Promise<void> {
 
     let flushedCount = 0;
 
-    // Loss-resistant delivery process:
-    // 1. Peek at head (index 0) WITHOUT removing it from Redis.
-    // 2. Publish to MQTT terminal downlink topic.
-    // 3. ONLY once MQTT publish succeeds, remove the item from the head of the queue.
-    // 4. If MQTT publish fails, the command remains safely at index 0 for future retry.
+    // 1. Look at the first command without removing it.
+    // 2. Send it.
+    // 3. Only after the send succeeds, remove exactly that command.
+    // If the send fails, the command stays in the queue for the next try.
     while (true) {
       const command = await redis.lindex(queueKey, 0);
-      if (!command) {
-        break; // Queue is empty
-      }
+      if (!command) break;
 
       try {
-        await _mqttPublish(normId, command);
+        await publishToTerminal(normId, command);
 
-        // Successful publish: atomically pop from the head of the queue exactly once
-        await redis.lpop(queueKey);
+        // Remove this exact command, not "whatever is first now". If the command was
+        // replaced while we were sending, this does nothing and the newer one stays.
+        await redis.lrem(queueKey, 1, command);
         flushedCount++;
         log.debug(
           { command: commandTag(command), flushedCount },
@@ -275,7 +276,6 @@ async function flushTerminalQueue(terminalId: string): Promise<void> {
           { command: commandTag(command), err: errMsg },
           "sync.flush_queue_publish_failed — command preserved in queue for retry"
         );
-        // Do NOT pop! The command remains at index 0 in Redis for next retry.
         break;
       }
     }
@@ -289,7 +289,7 @@ async function flushTerminalQueue(terminalId: string): Promise<void> {
   }
 }
 
-/// Send WL to specific terminals
+/// Send the full whitelist and blacklist to one terminal
 async function syncFullListsToTerminal(terminalId: string): Promise<void> {
   const log = logger.child({ terminalId });
   const MAX_CHUNK_BYTES = 500;
@@ -370,7 +370,6 @@ async function syncFullListsToTerminal(terminalId: string): Promise<void> {
 }
 
 export {
-  injectMqttPublisher,
   enqueueTerminalCommand,
   routeDeltaToTerminal,
   broadcastDeltaToFleet,
