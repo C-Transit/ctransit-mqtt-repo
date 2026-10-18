@@ -5,10 +5,8 @@ import {
   splitBatchPayload,
   parsePendingLink,
   parseSyncRequest,
-  parseDriverRegister,
   parseDriverEvent,
   type DriverEventData,
-  type DriverRegisterData,
   type SyncRequestData,
 } from "../utils/parser.js";
 import { ingestTransactionBatch } from "../services/ingestion.service.js";
@@ -20,7 +18,6 @@ import logger from "../config/logger.js";
 import type { Logger } from "pino";
 import { publishToTerminal } from "./downlinkQueue.js";
 import {
-  handleDriverRegister,
   handleDriverLogin,
   handleDriverLogout,
 } from "../services/driver.service.js";
@@ -146,18 +143,6 @@ async function handleLine(
       break;
     }
 
-    case PAYLOAD_TYPE.DRIVER_REGISTER: {
-      const { data, error } = parseDriverRegister(line);
-      if (error) {
-        log.warn({ error }, "uplink.driver_register_parse_error — discarding");
-        break;
-      }
-      if (data) {
-        await handleDriverRegisterEvent(terminalId, data, log);
-      }
-      break;
-    }
-
     default:
       log.warn({ lineLength: line.length }, "uplink.unknown_payload_type");
       break;
@@ -203,25 +188,6 @@ async function handleDriverEvent(
     await handleDriverLogout(terminalId, driverUid as string);
     await publishToTerminal(terminalId, "DRV:BYE");
     log.info({ driverUid }, "uplink.driver_logout");
-  }
-}
-
-async function handleDriverRegisterEvent(
-  terminalId: string,
-  data: DriverRegisterData,
-  log: ChildLogger
-): Promise<void> {
-  const result = await handleDriverRegister(terminalId, data);
-
-  if (result.success) {
-    await publishToTerminal(terminalId, `DRV:REG_OK,${data.matricNumber}`);
-    log.info({ matricNumber: data.matricNumber }, "uplink.driver_registered");
-  } else {
-    await publishToTerminal(terminalId, `DRV:REG_FAIL,${result.message}`);
-    log.warn(
-      { matricNumber: data.matricNumber },
-      "uplink.driver_register_failed"
-    );
   }
 }
 

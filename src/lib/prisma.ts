@@ -19,7 +19,7 @@ const prisma = new PrismaClient({
   },
 });
 
-let databaseHost = "invalid-url";
+let databaseHost: string;
 try {
   databaseHost = new URL(databaseUrl).host;
 } catch {

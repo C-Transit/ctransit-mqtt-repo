@@ -166,7 +166,9 @@ async function broadcastDeltaToFleet(deltaCommand: string): Promise<BroadcastSum
   const log = logger.child({ command: commandTag(deltaCommand) });
   const redis = getRedisClient();
 
+  // SYSTEM_TERMINAL is a bookkeeping row for top-ups, not a physical device.
   const terminals = await prisma.terminal.findMany({
+    where: { terminal_id: { not: "SYSTEM_TERMINAL" } },
     select: { terminal_id: true, status: true },
   });
 

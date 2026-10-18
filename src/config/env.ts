@@ -26,7 +26,6 @@ const REQUIRED_VARS = [
   "HIVEMQ_PORT",
   "HIVEMQ_CLIENT_ID",
   "MQTT_INTERNAL_SECRET",
-  "JWT_SECRET",
 ] as const;
 
 const isProduction = process.env.NODE_ENV === "production";
@@ -48,7 +47,6 @@ if (missing.length > 0) {
 if (isProduction) {
   const disallowedDefaults: Record<string, string> = {
     MQTT_INTERNAL_SECRET: "dev_secret",
-    JWT_SECRET: "dev_jwt_secret",
     MQTT_PASSWORD: "dev_pass",
     MQTT_USERNAME: "dev_user",
   };
@@ -90,8 +88,8 @@ interface Config {
   ledger: {
     baseFare: number;
   };
-  jwt: {
-    secret: string;
+  terminals: {
+    autoRegister: boolean;
   };
 }
 
@@ -116,8 +114,9 @@ const env: Config = {
   ledger: {
     baseFare: parseFloatSafe(process.env.BASE_FARE, 150),
   },
-  jwt: {
-    secret: process.env.JWT_SECRET as string,
+  terminals: {
+    // Set AUTO_REGISTER_TERMINALS=false once every real terminal exists in the database.
+    autoRegister: process.env.AUTO_REGISTER_TERMINALS !== "false",
   },
 };
 

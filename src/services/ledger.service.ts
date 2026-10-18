@@ -53,15 +53,6 @@ function isBelowThreshold(balance: number): boolean {
   return balance < env.ledger.baseFare;
 }
 
-async function activateWallet(studentUid: string): Promise<void> {
-  await prisma.wallet.upsert({
-    where: { student_uid: studentUid },
-    update: { is_linked: true },
-    create: { student_uid: studentUid, balance: 0, is_linked: true },
-  });
-  logger.info({ studentUid }, "ledger.wallet_activated");
-}
-
 // Same inputs, same order as before, so ids of already-settled taps do not change.
 function computeFingerprint(p: {
   terminalId: string;
@@ -323,4 +314,4 @@ async function settleRideTransaction(
   }
 }
 
-export { settleRideTransaction, isBelowThreshold, activateWallet };
+export { settleRideTransaction, isBelowThreshold };
