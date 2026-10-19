@@ -24,6 +24,9 @@ import {
 
 type ChildLogger = Logger;
 
+// "CMD:<12 hex>;" is an acknowledgement of a wrapped fleet command.
+const CMD_ACK_PATTERN = /^CMD:([0-9a-f]{12});/;
+
 const errText = (err: unknown): string =>
   err instanceof Error ? err.message : "Unknown error";
 
@@ -43,6 +46,12 @@ async function routeUplinkMessage(
   topic: string,
   payloadBuffer: Buffer
 ): Promise<void> {
+  // The server now also subscribes to rx; those messages are not uplinks.
+  if (topic.endsWith("/rx")) {
+    logger.debug({ topic }, "uplink.rx_topic_ignored");
+    return;
+  }
+
   const terminalId = extractTerminalId(topic);
   if (!terminalId) {
     logger.warn({ topic }, "uplink.unrecognised_topic_format — discarding");
@@ -62,26 +71,48 @@ async function routeUplinkMessage(
     return;
   }
 
-  const { deviceId, lines } = splitBatchPayload(rawMessage, terminalId);
+  // Records are separated by newlines. Acks are handled line by line first, so a
+  // "CMD:<id>;..." record is never split on "|" or treated as tap data.
+  const records = rawMessage
+    .split(/\r?\n/)
+    .map((r) => r.trim())
+    .filter((r) => r.length > 0);
 
-  // The topic is the only identity the broker vouches for. A device id written inside
-  // the payload must match it, otherwise one terminal could act as another.
-  if (deviceId !== terminalId) {
-    log.warn(
-      { claimedDeviceId: deviceId },
-      "uplink.device_id_topic_mismatch — discarding"
-    );
-    return;
-  }
+  for (const record of records) {
+    const ack = CMD_ACK_PATTERN.exec(record);
+    if (ack) {
+      log.debug(
+        {
+          commandId: ack[1],
+          terminalId,
+          innerLength: record.length - ack[0].length,
+        },
+        "uplink.ack_received"
+      );
+      continue;
+    }
 
-  log.debug({ messageCount: lines.length }, "uplink.batch_split_complete");
+    const { deviceId, lines } = splitBatchPayload(record, terminalId);
 
-  // Each line is handled on its own: one failing line must not drop the rest.
-  for (const line of lines) {
-    try {
-      await handleLine(terminalId, line, log);
-    } catch (err) {
-      log.error({ err: errText(err) }, "uplink.line_processing_failed");
+    // The topic is the only identity the broker vouches for. A device id written inside
+    // the payload must match it, otherwise one terminal could act as another.
+    if (deviceId !== terminalId) {
+      log.warn(
+        { claimedDeviceId: deviceId },
+        "uplink.device_id_topic_mismatch — discarding"
+      );
+      continue;
+    }
+
+    log.debug({ messageCount: lines.length }, "uplink.batch_split_complete");
+
+    // Each line is handled on its own: one failing line must not drop the rest.
+    for (const line of lines) {
+      try {
+        await handleLine(terminalId, line, log);
+      } catch (err) {
+        log.error({ err: errText(err) }, "uplink.line_processing_failed");
+      }
     }
   }
 }

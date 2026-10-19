@@ -94,6 +94,29 @@ export function splitBatchPayload(
     .map((l) => l.trim())
     .filter((l) => l.length > 0);
 
+  // Only the first record may carry a "<TOPIC_TERMINAL_ID>," prefix. Doubles as a
+  // second identity check: a different id here is surfaced as deviceId so the
+  // caller's existing mismatch guard rejects it.
+  if (lines.length > 0) {
+    const first = lines[0];
+    const commaIdx = first.indexOf(",");
+    if (commaIdx > 0) {
+      const firstField = first.substring(0, commaIdx).trim();
+      const remainder = first.substring(commaIdx + 1).trim();
+      if (CARD_UID_PATTERN.test(firstField)) {
+        const isTap = remainder.split(",").length === 5;
+        const isPending = remainder.toUpperCase().startsWith("PENDING_LINK:");
+        if (isTap || isPending) {
+          if (firstField.toUpperCase() === fallbackTerminalId.toUpperCase()) {
+            lines[0] = remainder;
+          } else {
+            deviceId = firstField.toUpperCase();
+          }
+        }
+      }
+    }
+  }
+
   return { deviceId, lines };
 }
 
