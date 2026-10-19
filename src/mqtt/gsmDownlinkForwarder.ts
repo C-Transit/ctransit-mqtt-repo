@@ -1,5 +1,6 @@
 import type { MqttClient } from "mqtt";
 import env from "../config/env.js";
+import type { Logger } from "pino";
 import logger from "../config/logger.js";
 
 const POST_TIMEOUT_MS = 5000;
@@ -48,7 +49,7 @@ async function postToWorker(terminalId: string, commandCsv: string): Promise<Pos
 async function forwardWithRetry(
   terminalId: string,
   commandCsv: string,
-  log: ReturnType<typeof logger.child>
+  log: Logger
 ): Promise<void> {
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     const r = await postToWorker(terminalId, commandCsv);

@@ -81,7 +81,7 @@ async function routeUplinkMessage(
   for (const record of records) {
     const ack = CMD_ACK_PATTERN.exec(record);
     if (ack) {
-      log.debug(
+      log.info(
         {
           commandId: ack[1],
           terminalId,
