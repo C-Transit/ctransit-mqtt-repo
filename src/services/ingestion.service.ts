@@ -1,9 +1,10 @@
+// src/services/ingestion.service.ts
 "use strict";
 
 import {
   isBelowThreshold,
   settleRideTransaction,
-  type SettleRideParams,
+  type SettleRideResult,
 } from "./ledger.service.js";
 import logger from "../config/logger.js";
 import {
@@ -16,7 +17,47 @@ import { publishToTerminal } from "../mqtt/downlinkQueue.js";
 
 type LoggerInstance = typeof logger;
 
-// Ingests a batch of transaction payloads from a terminal, validates each row, and forwards valid transactions to the backend for settlement. Invalid rows are logged and acknowledged with an error response to the terminal.
+const errText = (err: unknown): string =>
+  err instanceof Error ? err.message : "Unknown error";
+
+// Ack for a settlement result. null = send nothing, so the terminal keeps the tap and resends.
+function ackFor(result: SettleRideResult, cardUid: string): string | null {
+  switch (result.status) {
+    case "SUCCESS":
+    case "DUPLICATE":
+      // A duplicate gets the same OK so the terminal clears its retry queue.
+      return `ACK:OK,${cardUid},${(result.newBalance ?? 0).toFixed(2)}`;
+    case "INSUFFICIENT_BALANCE":
+      return `ACK:FAIL,${cardUid},INSUFFICIENT_BALANCE`;
+    case "BLACKLISTED":
+      return `ACK:FAIL,${cardUid},BLACKLISTED`;
+    case "CARD_NOT_REGISTERED":
+      return `ACK:FAIL,${cardUid},CARD_NOT_REGISTERED`;
+    case "NOT_WHITELISTED":
+      return `ACK:FAIL,${cardUid},NOT_WHITELISTED`;
+    case "DRIVER_MISMATCH":
+      return `ACK:FAIL,${cardUid},DRIVER_MISMATCH`;
+    case "INVALID_REQUEST":
+      return `ACK:FAIL,${cardUid},MALFORMED_PAYLOAD`;
+    default:
+      return null;
+  }
+}
+
+async function sendAck(
+  terminalId: string,
+  ack: string,
+  log: LoggerInstance
+): Promise<void> {
+  try {
+    await publishToTerminal(terminalId, ack);
+  } catch (err) {
+    // The charge (if any) is already committed. The terminal will resend and get a DUPLICATE OK.
+    log.error({ err: errText(err) }, "ingestion.ack_publish_failed");
+  }
+}
+
+// Ingests one tap line from a terminal. terminalId is the MQTT topic identity.
 async function ingestTransactionBatch(
   terminalId: string,
   rawPayload: string
@@ -26,10 +67,9 @@ async function ingestTransactionBatch(
 
   const { valid, invalid } = parseTransactionBatch(rawPayload, terminalId);
 
-  // Error Isolation: structured error logging for malformed rows
   if (invalid.length > 0) {
     log.warn(
-      { invalidRows: invalid, terminalId },
+      { invalidCount: invalid.length, reasons: invalid.map((i) => i.reason) },
       "ingestion.invalid_rows_detected"
     );
     for (const item of invalid) {
@@ -39,7 +79,7 @@ async function ingestTransactionBatch(
           terminalId,
           `ACK:FAIL,${firstToken},MALFORMED_PAYLOAD`
         ).catch((err) => {
-          log.error({ err }, "ingestion.invalid_row_ack_failed");
+          log.error({ err: errText(err) }, "ingestion.invalid_row_ack_failed");
         });
       }
     }
@@ -50,7 +90,6 @@ async function ingestTransactionBatch(
     return;
   }
 
-  // Process each valid transaction independently with isolated error boundary
   for (const tx of valid) {
     await processTransaction(tx, terminalId, log);
   }
@@ -58,188 +97,76 @@ async function ingestTransactionBatch(
   log.info({ processedCount: valid.length }, "ingestion.batch_complete");
 }
 
-// Processes a single transaction, forwards it to the backend for settlement, and handles the response by sending an appropriate ACK to the terminal. Errors are logged and result in a SERVER_ERROR ACK.
+// Never throws: one bad tap must not stop the rest of the batch.
 async function processTransaction(
   tx: ParsedTransaction,
   terminalId: string,
   log: LoggerInstance
 ): Promise<void> {
-  const effectiveCardUid = tx.card_uid || tx.student_uid;
-  const effectiveTerminalId = tx.terminal_id || terminalId;
-
-  const txLog = log.child({
-    transactionId: tx.transaction_id,
-    cardUid: effectiveCardUid,
-    terminalId: effectiveTerminalId,
-    location: tx.location,
-    driverUid: tx.driver_uid,
-  });
+  const cardUid = tx.card_uid || tx.student_uid;
+  const txLog = log.child({ cardUid, location: tx.location });
 
   try {
-    const backendPayload: SettleRideParams = {
-      protocolVersion: tx.location ? "v1.1.0L" : undefined,
-      terminalId: effectiveTerminalId,
-      studentUid: effectiveCardUid,
-      cardUid: effectiveCardUid,
-      rawAmount: tx.raw_amount,
-      amount: tx.amount,
-      timestamp: tx.timestamp,
-      driverUid: tx.driver_uid || null,
-      location: tx.location || null,
-      transactionId: tx.transaction_id,
-      syncedAt: tx.synced_at,
-    };
+    // The topic is the only identity the broker vouches for. Ignore spoofed device ids.
+    if (tx.terminal_id.toUpperCase() !== terminalId.toUpperCase()) {
+      txLog.warn(
+        { claimedTerminalId: tx.terminal_id },
+        "ingestion.terminal_id_mismatch_rejected"
+      );
+      return;
+    }
 
-    const result = await settleRideTransaction(backendPayload);
+    // Every terminal runs v1.1.0L, so a line without a location letter is not a valid tap.
+    if (!tx.location) {
+      txLog.warn("ingestion.legacy_format_rejected");
+      await sendAck(terminalId, `ACK:FAIL,${cardUid},MALFORMED_PAYLOAD`, txLog);
+      return;
+    }
 
-    switch (result.status) {
-      case "SUCCESS": {
-        const balanceStr = (result.newBalance ?? 0).toFixed(2);
-        await publishToTerminal(
-          effectiveTerminalId,
-          `ACK:OK,${effectiveCardUid},${balanceStr}`
-        );
-        txLog.info(
-          { newBalance: result.newBalance, cardUid: effectiveCardUid },
-          "ingestion.ack_sent_to_terminal"
-        );
+    let result: SettleRideResult;
+    try {
+      result = await settleRideTransaction({
+        terminalId,
+        cardUid,
+        rawAmount: tx.raw_amount as number,
+        timestamp: tx.timestamp as number,
+        driverUid: tx.driver_uid || "",
+        location: tx.location,
+      });
+    } catch (err) {
+      // The ledger transaction rolled back. No ack: the terminal keeps the tap and resends it.
+      txLog.error({ err: errText(err) }, "ingestion.settlement_error_no_ack");
+      return;
+    }
 
-        // Post-deduction blacklist broadcast to terminal fleet
-        if (
-          result.belowThreshold ||
-          (result.newBalance !== null && isBelowThreshold(result.newBalance))
-        ) {
-          const blacklistCmd = buildDeltaCommand("ADD", "BL", effectiveCardUid);
-          txLog.info(
-            { newBalance: result.newBalance, cardUid: effectiveCardUid },
-            "ingestion.balance_now_below_threshold — broadcasting blacklist delta"
-          );
+    if (result.status !== "SUCCESS" && result.status !== "DUPLICATE") {
+      txLog.warn({ status: result.status }, "ingestion.settlement_rejected");
+    }
 
-          process.nextTick(async () => {
-            try {
-              await broadcastDeltaToFleet(blacklistCmd);
-              txLog.info(
-                { blacklistCmd },
-                "ingestion.blacklist_broadcast_sent"
-              );
-            } catch (err) {
-              const errMsg =
-                err instanceof Error ? err.message : "Unknown error";
-              txLog.error(
-                { err: errMsg },
-                "ingestion.post_deduction_blacklist_broadcast_failed"
-              );
-            }
-          });
-        }
-        break;
-      }
+    const ack = ackFor(result, cardUid);
+    if (ack) {
+      await sendAck(terminalId, ack, txLog);
+    } else {
+      txLog.error({ status: result.status }, "ingestion.unhandled_settlement_status");
+    }
 
-      case "DUPLICATE": {
-        txLog.info(
-          { transactionId: result.transactionId || tx.transaction_id },
-          "ingestion.duplicate_transaction_acknowledged"
+    // Tell the fleet when a settled ride pushed the student under the threshold.
+    if (
+      result.status === "SUCCESS" &&
+      (result.belowThreshold ||
+        (result.newBalance !== null && isBelowThreshold(result.newBalance)))
+    ) {
+      broadcastDeltaToFleet(buildDeltaCommand("ADD", "BL", cardUid))
+        .then(() => txLog.info("ingestion.blacklist_broadcast_sent"))
+        .catch((err) =>
+          txLog.error(
+            { err: errText(err) },
+            "ingestion.post_deduction_blacklist_broadcast_failed"
+          )
         );
-        // ACK with current balance so terminal clears retry queue without double charging
-        const balanceStr = (result.newBalance ?? 0).toFixed(2);
-        await publishToTerminal(
-          effectiveTerminalId,
-          `ACK:OK,${effectiveCardUid},${balanceStr}`
-        );
-        break;
-      }
-
-      case "INSUFFICIENT_BALANCE": {
-        txLog.warn(
-          { cardUid: effectiveCardUid, fare: tx.amount },
-          "ingestion.insufficient_balance"
-        );
-        await publishToTerminal(
-          effectiveTerminalId,
-          `ACK:FAIL,${effectiveCardUid},INSUFFICIENT_BALANCE`
-        );
-        break;
-      }
-
-      case "BLACKLISTED": {
-        txLog.warn(
-          { cardUid: effectiveCardUid },
-          "ingestion.student_is_blacklisted"
-        );
-        await publishToTerminal(
-          effectiveTerminalId,
-          `ACK:FAIL,${effectiveCardUid},BLACKLISTED`
-        );
-        break;
-      }
-
-      case "CARD_NOT_REGISTERED": {
-        txLog.warn(
-          { cardUid: effectiveCardUid },
-          "ingestion.card_uid_not_registered"
-        );
-        await publishToTerminal(
-          effectiveTerminalId,
-          `ACK:FAIL,${effectiveCardUid},CARD_NOT_REGISTERED`
-        );
-        break;
-      }
-
-      case "NOT_WHITELISTED":
-      case "NOT_FOUND": {
-        txLog.warn(
-          { cardUid: effectiveCardUid },
-          "ingestion.student_not_whitelisted"
-        );
-        await publishToTerminal(
-          effectiveTerminalId,
-          `ACK:FAIL,${effectiveCardUid},NOT_WHITELISTED`
-        );
-        break;
-      }
-
-      case "DRIVER_MISMATCH": {
-        txLog.warn(
-          {
-            cardUid: effectiveCardUid,
-            driverUid: tx.driver_uid,
-            terminalId: effectiveTerminalId,
-            reason: "DRIVER_MISMATCH",
-          },
-          "ingestion.driver_mismatch_rejected"
-        );
-        await publishToTerminal(
-          effectiveTerminalId,
-          `ACK:FAIL,${effectiveCardUid},DRIVER_MISMATCH`
-        );
-        break;
-      }
-
-      default: {
-        txLog.error(
-          { status: result.status },
-          "ingestion.unhandled_settlement_status"
-        );
-        await publishToTerminal(
-          effectiveTerminalId,
-          `ACK:FAIL,${effectiveCardUid},SERVER_ERROR`
-        );
-        break;
-      }
     }
   } catch (err) {
-    const errMsg = err instanceof Error ? err.message : "Unknown error";
-    txLog.error({ err: errMsg }, "ingestion.transaction_processing_error");
-    try {
-      await publishToTerminal(
-        effectiveTerminalId,
-        `ACK:FAIL,${effectiveCardUid},SERVER_ERROR`
-      );
-    } catch (ackErr) {
-      const ackErrMsg =
-        ackErr instanceof Error ? ackErr.message : "Unknown error";
-      txLog.error({ err: ackErrMsg }, "ingestion.ack_send_failed");
-    }
+    txLog.error({ err: errText(err) }, "ingestion.transaction_processing_error");
   }
 }
 

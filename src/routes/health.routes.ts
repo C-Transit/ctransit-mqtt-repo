@@ -1,6 +1,6 @@
 // src/routes/health.routes.ts
 import { Router, type Request, type Response } from "express";
-import { prisma } from "../services/ledger.service.js";
+import prisma from "../lib/prisma.js";
 import logger from "../config/logger.js";
 
 const router = Router();

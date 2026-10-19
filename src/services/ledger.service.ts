@@ -1,3 +1,4 @@
+// src/services/ledger.service.ts
 "use strict";
 
 import crypto from "node:crypto";
@@ -6,114 +7,26 @@ import type { Prisma } from "@prisma/client";
 import logger from "../config/logger.js";
 import env from "../config/env.js";
 
-// Support both standard PrismaClient and Transactional Client
 type DbClient = typeof prisma | Prisma.TransactionClient;
 
-interface DeductionResult {
-  newBalance: number | null;
-  walletFound: boolean;
-}
+const PROTOCOL_VERSION = "v1.1.0L";
+const VALID_LOCATIONS = new Set(["A", "B", "C"]);
+const DRIVER_SHARE_PERCENT = 96;
 
-interface CreditResult {
-  previousBalance: number;
-  newBalance: number;
-}
+/** Must match the `SystemWallet.id` default in prisma/schema.prisma. */
+const SYSTEM_WALLET_ID = "CTRANSIT_SYSTEM";
+const SYSTEM_WALLET_NAME = "C-Transit Platform";
 
-async function deductFare(
-  studentUid: string,
-  amount: number,
-  transactionId: string,
-  dbClient: DbClient = prisma
-): Promise<DeductionResult> {
-  const childLogger = logger.child({ transactionId, studentUid, amount });
-  const wallet = await dbClient.wallet.findUnique({
-    where: { student_uid: studentUid },
-    select: { balance: true },
-  });
-
-  if (!wallet) {
-    childLogger.warn("ledger.wallet_not_found — skipping deduction");
-    return { newBalance: null, walletFound: false };
-  }
-
-  const updatedWallet = await dbClient.wallet.update({
-    where: { student_uid: studentUid },
-    data: { balance: { decrement: amount } },
-    select: { balance: true },
-  });
-
-  const newBalance = parseFloat(updatedWallet.balance.toString());
-  childLogger.info(
-    { previousBalance: parseFloat(wallet.balance.toString()), newBalance },
-    "ledger.fare_deducted"
-  );
-  return { newBalance, walletFound: true };
-}
-
-function isBelowThreshold(balance: number): boolean {
-  return balance < env.ledger.baseFare;
-}
-
-function hasCrossedAboveThreshold(
-  previousBalance: number,
-  newBalance: number
-): boolean {
-  return (
-    previousBalance < env.ledger.baseFare && newBalance >= env.ledger.baseFare
-  );
-}
-
-async function activateWallet(studentUid: string): Promise<void> {
-  await prisma.wallet.upsert({
-    where: { student_uid: studentUid },
-    update: { is_linked: true },
-    create: { student_uid: studentUid, balance: 0, is_linked: true },
-  });
-  logger.info({ studentUid }, "ledger.wallet_activated");
-}
-
-async function creditWallet(
-  studentUid: string,
-  amount: number,
-  dbClient: DbClient = prisma
-): Promise<CreditResult | null> {
-  const wallet = await dbClient.wallet.findUnique({
-    where: { student_uid: studentUid },
-    select: { balance: true },
-  });
-
-  if (!wallet) {
-    logger.warn({ studentUid }, "ledger.credit_wallet_not_found");
-    return null;
-  }
-
-  const updatedWallet = await dbClient.wallet.update({
-    where: { student_uid: studentUid },
-    data: { balance: { increment: amount } },
-    select: { balance: true },
-  });
-
-  const previousBalance = parseFloat(wallet.balance.toString());
-  const newBalance = parseFloat(updatedWallet.balance.toString());
-  logger.info(
-    { studentUid, previousBalance, newBalance, amount },
-    "ledger.wallet_credited"
-  );
-  return { previousBalance, newBalance };
-}
+const toNumber = (value: { toString(): string }): number =>
+  parseFloat(value.toString());
 
 export interface SettleRideParams {
-  transactionId?: string;
-  terminalId: string;
-  studentUid: string;
-  cardUid?: string;
-  rawAmount?: number;
-  amount: number;
-  timestamp?: number;
-  driverUid: string | null;
-  location?: string | null;
-  protocolVersion?: string;
-  syncedAt?: Date;
+  terminalId: string; // taken from the MQTT topic, never from the payload
+  cardUid: string; // student NFC card UID
+  rawAmount: number; // exactly as the terminal sent it; used only for the tap fingerprint
+  timestamp: number; // epoch seconds, from the terminal
+  driverUid: string; // driver card UID presented on the terminal
+  location: string; // A | B | C
 }
 
 export type SettlementStatus =
@@ -124,7 +37,7 @@ export type SettlementStatus =
   | "BLACKLISTED"
   | "CARD_NOT_REGISTERED"
   | "DRIVER_MISMATCH"
-  | "NOT_FOUND";
+  | "INVALID_REQUEST";
 
 export interface SettleRideResult {
   status: SettlementStatus;
@@ -136,338 +49,217 @@ export interface SettleRideResult {
   belowThreshold?: boolean;
 }
 
-// Fingerprinting backend security link
-export function computeDeterministicFingerprint(params: {
-  protocolVersion?: string;
+function isBelowThreshold(balance: number): boolean {
+  return balance < env.ledger.baseFare;
+}
+
+// Same inputs, same order as before, so ids of already-settled taps do not change.
+function computeFingerprint(p: {
   terminalId: string;
   cardUid: string;
   rawAmount: number;
   timestamp: number;
-  driverUid: string | null;
+  driverUid: string;
   location: string;
 }): string {
-  const proto = params.protocolVersion || "v1.1.0L";
-  const drv = params.driverUid || "";
-  const input = `${proto}${params.terminalId}${params.cardUid}${params.rawAmount}${params.timestamp}${drv}${params.location}`;
+  const input = `${PROTOCOL_VERSION}${p.terminalId}${p.cardUid}${p.rawAmount}${p.timestamp}${p.driverUid}${p.location}`;
   return crypto.createHash("sha256").update(input).digest("hex");
 }
 
-/**
- * Canonical id of the C-Transit system wallet row.
- * Must match the `SystemWallet.id` default in prisma/schema.prisma.
- */
-const SYSTEM_WALLET_ID = "CTRANSIT_SYSTEM";
-const SYSTEM_WALLET_NAME = "C-Transit Platform";
+function isUniqueViolation(err: unknown): boolean {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    "code" in err &&
+    (err as { code?: string }).code === "P2002"
+  );
+}
+
+// If this tap was already settled, answer with the balance of the student who was charged.
+async function findDuplicate(
+  db: DbClient,
+  txId: string
+): Promise<SettleRideResult | null> {
+  const existing = await db.transaction.findUnique({
+    where: { transaction_id: txId },
+    select: { student_uid: true, amount: true },
+  });
+  if (!existing) return null;
+
+  const wallet = await db.wallet.findUnique({
+    where: { student_uid: existing.student_uid },
+    select: { balance: true },
+  });
+  return {
+    status: "DUPLICATE",
+    newBalance: wallet ? toNumber(wallet.balance) : 0,
+    fare: toNumber(existing.amount),
+    transactionId: txId,
+  };
+}
 
 async function settleRideTransaction(
-  params: SettleRideParams,
-  dbClient: DbClient = prisma
+  params: SettleRideParams
 ): Promise<SettleRideResult> {
-  const {
-    transactionId,
+  const { terminalId, cardUid, rawAmount, timestamp, driverUid, location } =
+    params;
+
+  // Fail closed on anything the parser should already have rejected.
+  if (
+    !cardUid ||
+    !driverUid ||
+    !VALID_LOCATIONS.has(location) ||
+    !Number.isFinite(rawAmount) ||
+    rawAmount === 0 ||
+    !Number.isFinite(timestamp) ||
+    timestamp <= 0
+  ) {
+    logger.warn({ terminalId, location }, "ledger.invalid_settlement_request");
+    return { status: "INVALID_REQUEST", newBalance: null, fare: 0 };
+  }
+
+  const txId = computeFingerprint({
     terminalId,
-    studentUid,
     cardUid,
     rawAmount,
-    amount,
     timestamp,
     driverUid,
     location,
-    protocolVersion,
-    syncedAt,
-  } = params;
-
-  const effectiveCardUid = cardUid || studentUid;
-  const isV110L = protocolVersion === "v1.1.0L" || Boolean(location);
-
-  // Determine deterministic transactionId
-  let txId: string;
-  if (location) {
-    const proto = protocolVersion || "v1.1.0L";
-    const rawAmt = rawAmount !== undefined ? rawAmount : -Math.abs(amount);
-    const ts =
-      timestamp !== undefined
-        ? timestamp
-        : Math.floor((syncedAt?.getTime() ?? Date.now()) / 1000);
-    txId = computeDeterministicFingerprint({
-      protocolVersion: proto,
-      terminalId,
-      cardUid: effectiveCardUid,
-      rawAmount: rawAmt,
-      timestamp: ts,
-      driverUid: driverUid || null,
-      location,
-    });
-  } else {
-    // Legacy fallback format
-    const ts =
-      timestamp !== undefined
-        ? timestamp
-        : Math.floor((syncedAt?.getTime() ?? Date.now()) / 1000);
-    txId = transactionId || `${terminalId}-${ts}-${effectiveCardUid}`;
-  }
-
-  const childLogger = logger.child({
-    transactionId: txId,
-    cardUid: effectiveCardUid,
-    amount,
-    driverUid,
-    terminalId,
-    location,
   });
+  const log = logger.child({ transactionId: txId, terminalId, location });
 
-  const execute = async (tx_ctx: Prisma.TransactionClient) => {
-    // 1. Idempotency Check
-    const existingTx = await tx_ctx.transaction.findUnique({
-      where: { transaction_id: txId },
-    });
-
-    if (existingTx) {
-      childLogger.info(
-        { transactionId: txId },
-        "ledger.settle_ride_duplicate_detected"
-      );
-
-      // Resolve card UID to check current balance for idempotent ACK
-      const mapping = await tx_ctx.cardMapping.findUnique({
-        where: { card_uid: effectiveCardUid },
-        select: { student_uid: true },
-      });
-      const resolvedMatric = mapping ? mapping.student_uid : effectiveCardUid;
-      const currentWallet = await tx_ctx.wallet.findUnique({
-        where: { student_uid: resolvedMatric },
-        select: { balance: true },
-      });
-      const currentBalance = currentWallet
-        ? parseFloat(currentWallet.balance.toString())
-        : 0;
-      return {
-        status: "DUPLICATE" as const,
-        newBalance: currentBalance,
-        fare: amount,
-        transactionId: txId,
-      };
+  const execute = async (db: Prisma.TransactionClient): Promise<SettleRideResult> => {
+    // 1. Idempotency: a resent tap gets the same answer and no second charge.
+    const duplicate = await findDuplicate(db, txId);
+    if (duplicate) {
+      log.info("ledger.settle_ride_duplicate_detected");
+      return duplicate;
     }
 
-    // 2. Card Resolution (Backend owns CardMapping)
-    let matricNumber = effectiveCardUid;
-    const mapping = await tx_ctx.cardMapping.findUnique({
-      where: { card_uid: effectiveCardUid },
+    // 2. The server owns the fare. The terminal's amount is only checked, never trusted.
+    const fareConfig = await db.fareConfig.findUnique({
+      where: { code: location },
+      select: { amount: true },
+    });
+    const fare = fareConfig ? toNumber(fareConfig.amount) : 0;
+    if (!(fare > 0)) {
+      // Server misconfiguration: throw so no ack is sent and the terminal keeps the tap.
+      throw new Error(`FARE_NOT_CONFIGURED:${location}`);
+    }
+    if (Math.abs(rawAmount) !== fare) {
+      log.warn(
+        { claimedAmount: Math.abs(rawAmount), fare },
+        "ledger.fare_mismatch — charging the server fare"
+      );
+    }
+
+    // 3. Card -> student. No fallback: an unmapped card is not a registered card.
+    const mapping = await db.cardMapping.findUnique({
+      where: { card_uid: cardUid },
       select: { student_uid: true },
     });
-
-    if (mapping) {
-      matricNumber = mapping.student_uid;
-    } else {
-      // Check if effectiveCardUid directly corresponds to an existing wallet/user (for backwards compatibility)
-      const directWallet = await tx_ctx.wallet.findUnique({
-        where: { student_uid: effectiveCardUid },
-        select: { student_uid: true },
-      });
-      if (!directWallet) {
-        childLogger.warn(
-          { cardUid: effectiveCardUid },
-          "ledger.card_not_registered"
-        );
-        return {
-          status: "CARD_NOT_REGISTERED" as const,
-          newBalance: null,
-          fare: amount,
-          transactionId: txId,
-        };
-      }
+    if (!mapping) {
+      log.warn("ledger.card_not_registered");
+      return { status: "CARD_NOT_REGISTERED", newBalance: null, fare, transactionId: txId };
     }
+    const matricNumber = mapping.student_uid;
 
-    // 3. Blacklist Check (Backend owns domain validation)
-    const blacklisted = await tx_ctx.blacklist.findUnique({
+    // 4. Blacklist
+    const blacklisted = await db.blacklist.findUnique({
       where: { student_uid: matricNumber },
       select: { student_uid: true },
     });
     if (blacklisted) {
-      childLogger.warn(
-        { matricNumber, cardUid: effectiveCardUid },
-        "ledger.student_is_blacklisted"
-      );
-      return {
-        status: "BLACKLISTED" as const,
-        newBalance: null,
-        fare: amount,
-        transactionId: txId,
-      };
+      log.warn({ matricNumber }, "ledger.student_is_blacklisted");
+      return { status: "BLACKLISTED", newBalance: null, fare, transactionId: txId };
     }
 
-    // 4. Verify Student Wallet & Balance
-    const studentWallet = await tx_ctx.wallet.findUnique({
-      where: { student_uid: matricNumber },
-      select: { balance: true, is_linked: true },
+    // 5. Driver must be a registered driver card belonging to an actual DRIVER account.
+    const driverCredential = await db.driverCardCredential.findUnique({
+      where: { card_uid: driverUid },
+      select: { driver_uid: true },
     });
+    const driverUser = driverCredential
+      ? await db.user.findFirst({
+          where: { matricNumber: driverCredential.driver_uid, role: "DRIVER" },
+          select: { id: true },
+        })
+      : null;
+    if (!driverCredential || !driverUser) {
+      log.warn("ledger.driver_authorization_failed");
+      return { status: "DRIVER_MISMATCH", newBalance: null, fare, transactionId: txId };
+    }
+    const authorizedDriverUid = driverCredential.driver_uid;
 
-    if (!studentWallet || !studentWallet.is_linked) {
-      childLogger.warn(
-        { matricNumber },
-        "ledger.student_wallet_not_found_or_unlinked"
-      );
+    // 6. Guarded debit: one statement checks the balance and takes the money, so two
+    //    simultaneous taps can never both pass the check.
+    const debit = await db.wallet.updateMany({
+      where: { student_uid: matricNumber, is_linked: true, balance: { gte: fare } },
+      data: { balance: { decrement: fare } },
+    });
+    if (debit.count === 0) {
+      const wallet = await db.wallet.findUnique({
+        where: { student_uid: matricNumber },
+        select: { balance: true, is_linked: true },
+      });
+      if (!wallet || !wallet.is_linked) {
+        log.warn({ matricNumber }, "ledger.student_wallet_not_found_or_unlinked");
+        return { status: "NOT_WHITELISTED", newBalance: null, fare, transactionId: txId };
+      }
+      log.warn({ matricNumber, fare }, "ledger.student_insufficient_balance");
       return {
-        status: "NOT_WHITELISTED" as const,
-        newBalance: null,
-        fare: amount,
+        status: "INSUFFICIENT_BALANCE",
+        newBalance: toNumber(wallet.balance),
+        fare,
         transactionId: txId,
       };
     }
 
-    const currentStudentBalance = parseFloat(studentWallet.balance.toString());
-    if (currentStudentBalance < amount) {
-      childLogger.warn(
-        { balance: currentStudentBalance, fare: amount, matricNumber },
-        "ledger.student_insufficient_balance"
-      );
-      return {
-        status: "INSUFFICIENT_BALANCE" as const,
-        newBalance: currentStudentBalance,
-        fare: amount,
-        transactionId: txId,
-      };
-    }
+    const updatedStudent = await db.wallet.findUniqueOrThrow({
+      where: { student_uid: matricNumber },
+      select: { balance: true },
+    });
+    const newStudentBalance = toNumber(updatedStudent.balance);
 
-    // 5. Driver Authorization (Direct DB verification)
-    let authorizedDriverUid: string | null;
+    // 7. Split (96 / 4)
+    const driverCredit = Math.round(fare * DRIVER_SHARE_PERCENT) / 100;
+    const cTransitCredit = Math.round((fare - driverCredit) * 100) / 100;
 
-    if (isV110L) {
-      if (!driverUid) {
-        childLogger.warn(
-          { terminalId, reason: "DRIVER_MISMATCH" },
-          "ledger.driver_authorization_failed — no driverUid provided in payload"
-        );
-        return {
-          status: "DRIVER_MISMATCH" as const,
-          newBalance: currentStudentBalance,
-          fare: amount,
-          transactionId: txId,
-        };
-      }
-
-      // Verify the payload card UID exists in DriverCardCredential
-      const driverCredential = await tx_ctx.driverCardCredential.findUnique({
-        where: { card_uid: driverUid },
-        select: { driver_uid: true },
-      });
-
-      if (!driverCredential) {
-        childLogger.warn(
-          {
-            payloadDriverUid: driverUid,
-            terminalId,
-            reason: "DRIVER_MISMATCH",
-          },
-          "ledger.driver_authorization_failed — unregistered driver card"
-        );
-        return {
-          status: "DRIVER_MISMATCH" as const,
-          newBalance: currentStudentBalance,
-          fare: amount,
-          transactionId: txId,
-        };
-      }
-
-      // Verify the driver user profile is active and has the correct DRIVER role
-      const driverUser = await tx_ctx.user.findFirst({
-        where: { matricNumber: driverCredential.driver_uid, role: "DRIVER" },
-        select: { id: true },
-      });
-
-      if (!driverUser) {
-        childLogger.warn(
-          {
-            payloadDriverUid: driverUid,
-            resolvedMatric: driverCredential.driver_uid,
-            terminalId,
-            reason: "DRIVER_MISMATCH",
-          },
-          "ledger.driver_authorization_failed — active driver not registered in database or not a DRIVER"
-        );
-        return {
-          status: "DRIVER_MISMATCH" as const,
-          newBalance: currentStudentBalance,
-          fare: amount,
-          transactionId: txId,
-        };
-      }
-
-      authorizedDriverUid = driverCredential.driver_uid;
-    } else {
-      // Legacy behavior: use the terminal's active driver state
-      const terminal = await tx_ctx.terminal.findUnique({
-        where: { terminal_id: terminalId },
-        select: { active_driver_uid: true },
-      });
-      authorizedDriverUid = terminal?.active_driver_uid || null;
-
-      if (driverUid && driverUid !== authorizedDriverUid) {
-        childLogger.warn(
-          {
-            payloadDriverUid: driverUid,
-            assignedDriverUid: authorizedDriverUid,
-          },
-          "ledger.driver_authorization — payload driver differs from terminal active driver, using authorized driver"
-        );
-      }
-    }
-
-    // 6. Compute 4% fee deduction
-    const driverCredit = Math.round(amount * 96) / 100;
-    const cTransitCredit = Math.round((amount - driverCredit) * 100) / 100;
-
-    // 7. Create Transaction Record (with full split persisted for audit)
-    await tx_ctx.transaction.create({
+    // 8. Ledger row. The unique transaction_id means a concurrent duplicate fails here and
+    //    the whole transaction, including the debit above, rolls back.
+    await db.transaction.create({
       data: {
         transaction_id: txId,
         type: "RIDE",
         terminal_id: terminalId,
         student_uid: matricNumber,
-        amount: amount,
-        fare: amount,
+        amount: fare,
+        fare,
         driver_share: driverCredit,
         ctransit_share: cTransitCredit,
         driver_uid: authorizedDriverUid,
-        location: location || null,
-        card_uid: effectiveCardUid,
-        tapped_at: timestamp !== undefined ? new Date(timestamp * 1000) : null,
-        synced_at:
-          syncedAt ?? (timestamp ? new Date(timestamp * 1000) : new Date()),
+        location,
+        card_uid: cardUid,
+        tapped_at: new Date(timestamp * 1000),
+        synced_at: new Date(timestamp * 1000),
       },
     });
 
-    // 8. Atomic Balance Updates
-
-    // A) Student: -100%
-    const updatedStudentWallet = await tx_ctx.wallet.update({
-      where: { student_uid: matricNumber },
-      data: { balance: { decrement: amount } },
-      select: { balance: true },
+    // 9. Credits: driver +96%, platform +4%. Any failure rolls everything back.
+    await db.driverWallet.upsert({
+      where: { driver_uid: authorizedDriverUid },
+      update: {
+        balance: { increment: driverCredit },
+        total_earnings: { increment: driverCredit },
+      },
+      create: {
+        driver_uid: authorizedDriverUid,
+        balance: driverCredit,
+        total_earnings: driverCredit,
+      },
     });
-    const newStudentBalance = parseFloat(
-      updatedStudentWallet.balance.toString()
-    );
 
-    // B) Driver: +96%  → uses DriverWallet, NOT Wallet
-    if (authorizedDriverUid) {
-      await tx_ctx.driverWallet.upsert({
-        where: { driver_uid: authorizedDriverUid },
-        update: {
-          balance: { increment: driverCredit },
-          total_earnings: { increment: driverCredit },
-        },
-        create: {
-          driver_uid: authorizedDriverUid,
-          balance: driverCredit,
-          total_earnings: driverCredit,
-        },
-      });
-    }
-
-    // C) C-Transit Platform: +4%  → uses SystemWallet, NOT Wallet
-    // No `.catch()` — if this fails, the whole transaction must roll back.
-    await tx_ctx.systemWallet.upsert({
+    await db.systemWallet.upsert({
       where: { id: SYSTEM_WALLET_ID },
       update: {
         balance: { increment: cTransitCredit },
@@ -481,33 +273,25 @@ async function settleRideTransaction(
       },
     });
 
-    // 9. Low-balance auto-blacklisting in database
+    // 10. Low-balance auto-blacklist
     const belowThreshold = isBelowThreshold(newStudentBalance);
     if (belowThreshold) {
-      await tx_ctx.blacklist.upsert({
+      await db.blacklist.upsert({
         where: { student_uid: matricNumber },
         update: { blacklistedAt: new Date() },
         create: { student_uid: matricNumber, reason: "LOW_BALANCE" },
       });
     }
 
-    childLogger.info(
-      {
-        previousBalance: currentStudentBalance,
-        newBalance: newStudentBalance,
-        fare: amount,
-        driverCredit,
-        cTransitCredit,
-        transactionId: txId,
-        belowThreshold,
-      },
+    log.info(
+      { newBalance: newStudentBalance, fare, driverCredit, cTransitCredit, belowThreshold },
       "ledger.ride_settled_96_4_atomic"
     );
 
     return {
-      status: "SUCCESS" as const,
+      status: "SUCCESS",
       newBalance: newStudentBalance,
-      fare: amount,
+      fare,
       driverAmount: driverCredit,
       cTransitAmount: cTransitCredit,
       transactionId: txId,
@@ -516,66 +300,18 @@ async function settleRideTransaction(
   };
 
   try {
-    if (
-      "$transaction" in dbClient &&
-      typeof dbClient.$transaction === "function"
-    ) {
-      return await (dbClient as typeof prisma).$transaction(execute, {
-        timeout: 15000,
-      });
-    } else {
-      return await execute(dbClient as Prisma.TransactionClient);
-    }
+    return await prisma.$transaction(execute, { timeout: 15000 });
   } catch (err: unknown) {
-    // If concurrent insert failed with unique constraint on transaction_id, resolve as DUPLICATE
-    const isUniqueConstraint =
-      typeof err === "object" &&
-      err !== null &&
-      (("code" in err && err.code === "P2002") ||
-        ("message" in err &&
-          typeof err.message === "string" &&
-          (err.message.includes("Unique constraint") ||
-            err.message.includes("duplicate key"))));
-
-    if (isUniqueConstraint) {
-      childLogger.info(
-        { transactionId: txId },
-        "ledger.settle_ride_concurrent_duplicate_resolved"
-      );
-      const existing = await dbClient.transaction.findUnique({
-        where: { transaction_id: txId },
-      });
-      if (existing) {
-        const mapping = await dbClient.cardMapping.findUnique({
-          where: { card_uid: effectiveCardUid },
-          select: { student_uid: true },
-        });
-        const resolvedMatric = mapping ? mapping.student_uid : effectiveCardUid;
-        const currentWallet = await dbClient.wallet.findUnique({
-          where: { student_uid: resolvedMatric },
-          select: { balance: true },
-        });
-        const currentBalance = currentWallet
-          ? parseFloat(currentWallet.balance.toString())
-          : 0;
-        return {
-          status: "DUPLICATE" as const,
-          newBalance: currentBalance,
-          fare: amount,
-          transactionId: txId,
-        };
+    // A concurrent identical tap lost the race on transaction_id: answer as a duplicate.
+    if (isUniqueViolation(err)) {
+      const duplicate = await findDuplicate(prisma, txId);
+      if (duplicate) {
+        log.info("ledger.settle_ride_concurrent_duplicate_resolved");
+        return duplicate;
       }
     }
     throw err;
   }
 }
 
-export {
-  deductFare,
-  settleRideTransaction,
-  isBelowThreshold,
-  hasCrossedAboveThreshold,
-  activateWallet,
-  creditWallet,
-  prisma,
-};
+export { settleRideTransaction, isBelowThreshold };

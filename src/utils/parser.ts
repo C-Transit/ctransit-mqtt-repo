@@ -1,7 +1,7 @@
-// Update V1.1.0 parser for terminal payload
+// src/utils/parser.ts
 "use strict";
 
-// Utility type for strict error handling across all parsers
+// Strict error handling across all parsers
 export type ParseResult<T> =
   | { error: string; data?: undefined }
   | { data: T; error?: undefined };
@@ -12,29 +12,19 @@ export const PAYLOAD_TYPE = {
   SYNC_REQUEST: "SYNC_REQUEST",
   SYS_FULL_SYNC: "SYS_FULL_SYNC",
   DRIVER_EVENT: "DRIVER_EVENT",
-  DRIVER_REGISTER: "DRIVER_REGISTER",
   UNKNOWN: "UNKNOWN",
 } as const;
 
 export type PayloadType = (typeof PAYLOAD_TYPE)[keyof typeof PAYLOAD_TYPE];
-
-export const VALID_LOCATIONS = ["A", "B", "C"] as const;
-export type ValidLocation = (typeof VALID_LOCATIONS)[number];
-
-export const LOCATION_NAMES: Record<ValidLocation, string> = {
-  A: "Bus Park",
-  B: "Department",
-  C: "Hostel/Clinic",
-};
 
 export interface ParsedTransaction {
   transaction_id: string;
   terminal_id: string;
   student_uid: string;
   card_uid?: string;
-  amount: number; 
-  raw_amount?: number; 
-  timestamp?: number; 
+  amount: number;
+  raw_amount?: number;
+  timestamp?: number;
   driver_uid: string | null;
   location?: string | null;
   synced_at: Date;
@@ -64,18 +54,18 @@ export interface SyncRequestData {
   location: string;
 }
 
-export interface DriverRegisterData {
-  firstname: string;
-  lastname: string;
-  matricNumber: string;
-}
-
 export interface BatchSplitResult {
   deviceId: string;
   lines: string[];
 }
 
-// Splits into different batch before matching
+// Card UIDs and driver card UIDs are at most 20 characters in the database.
+const CARD_UID_PATTERN = /^[A-Za-z0-9_-]{1,20}$/;
+const AMOUNT_PATTERN = /^-?\d+(\.\d{1,2})?$/;
+// Epoch seconds. 7 to 11 digits so a terminal with an unsynced clock is still accepted, as before.
+const TIMESTAMP_PATTERN = /^\d{7,11}$/;
+
+// Splits a message into lines. A leading "DEVICE:" prefix is returned as deviceId.
 export function splitBatchPayload(
   raw: string,
   fallbackTerminalId: string
@@ -84,7 +74,6 @@ export function splitBatchPayload(
   let deviceId = fallbackTerminalId;
   let body = trimmed;
 
-  // Extract leading device_id if present before a colon: e.g. "8HY1K:..."
   if (
     body.includes(":") &&
     !body.startsWith("PENDING_LINK:") &&
@@ -94,18 +83,39 @@ export function splitBatchPayload(
   ) {
     const colonIdx = body.indexOf(":");
     const possibleDevice = body.substring(0, colonIdx).trim();
-    // Device ID is alphanumeric with no commas
     if (possibleDevice && !possibleDevice.includes(",") && !possibleDevice.includes("|")) {
       deviceId = possibleDevice.toUpperCase();
       body = body.substring(colonIdx + 1).trim();
     }
   }
 
-  // Split on pipe (|) or newline (\n)
   const lines = body
     .split(/[\n|]/)
     .map((l) => l.trim())
     .filter((l) => l.length > 0);
+
+  // Only the first record may carry a "<TOPIC_TERMINAL_ID>," prefix. Doubles as a
+  // second identity check: a different id here is surfaced as deviceId so the
+  // caller's existing mismatch guard rejects it.
+  if (lines.length > 0) {
+    const first = lines[0];
+    const commaIdx = first.indexOf(",");
+    if (commaIdx > 0) {
+      const firstField = first.substring(0, commaIdx).trim();
+      const remainder = first.substring(commaIdx + 1).trim();
+      if (CARD_UID_PATTERN.test(firstField)) {
+        const isTap = remainder.split(",").length === 5;
+        const isPending = remainder.toUpperCase().startsWith("PENDING_LINK:");
+        if (isTap || isPending) {
+          if (firstField.toUpperCase() === fallbackTerminalId.toUpperCase()) {
+            lines[0] = remainder;
+          } else {
+            deviceId = firstField.toUpperCase();
+          }
+        }
+      }
+    }
+  }
 
   return { deviceId, lines };
 }
@@ -113,7 +123,7 @@ export function splitBatchPayload(
 export function detectPayloadType(raw: string): PayloadType {
   let trimmed = raw.trim();
 
-  // Strip leading device prefix if present on individual line
+  // Strip leading device prefix if present on an individual line
   if (
     trimmed.includes(":") &&
     !trimmed.startsWith("PENDING_LINK:") &&
@@ -131,7 +141,6 @@ export function detectPayloadType(raw: string): PayloadType {
   if (trimmed.startsWith("PENDING_LINK:")) return PAYLOAD_TYPE.PENDING_LINK;
   if (trimmed.startsWith("SYNC_REQUEST")) return PAYLOAD_TYPE.SYNC_REQUEST;
   if (trimmed === "SYS:REQ_FULL_SYNC") return PAYLOAD_TYPE.SYS_FULL_SYNC;
-  if (trimmed.startsWith("DRV:REG,")) return PAYLOAD_TYPE.DRIVER_REGISTER;
   if (trimmed.startsWith("DRV:")) return PAYLOAD_TYPE.DRIVER_EVENT;
 
   if (
@@ -159,9 +168,7 @@ export function parseDriverEvent(raw: string): ParseResult<DriverEventData> {
   const [action, driverUid] = parts;
 
   if (action !== "LOGIN" && action !== "LOGOUT") {
-    return {
-      error: `Unknown DRV action: "${action}". Expected LOGIN or LOGOUT`,
-    };
+    return { error: "Unknown DRV action. Expected LOGIN or LOGOUT" };
   }
 
   if (!driverUid || driverUid.length === 0) {
@@ -193,117 +200,48 @@ export function parseTransactionBatch(
   return { valid, invalid };
 }
 
+// v1.1.0L tap line: cardUid,amount,timestamp,driverCardUid,location
+// Error messages never contain the line's values.
 export function parseSingleTransaction(
   line: string,
   terminalId: string
 ): ParseResult<ParsedTransaction> {
-  let actualTerminalId = terminalId;
-  let body = line.trim();
+  const parts = line.trim().split(",").map((p) => p.trim());
 
-  // Strip device prefix if present
-  if (
-    body.includes(":") &&
-    !body.startsWith("PENDING_LINK") &&
-    !body.startsWith("SYNC_REQUEST")
-  ) {
-    const colonIdx = body.indexOf(":");
-    const possibleDevice = body.substring(0, colonIdx).trim();
-    if (possibleDevice && !possibleDevice.includes(",")) {
-      actualTerminalId = possibleDevice.toUpperCase();
-      body = body.substring(colonIdx + 1).trim();
-    }
+  if (parts.length !== 5) {
+    return { error: `Expected 5 CSV fields, got ${parts.length}` };
   }
 
-  const parts = body.split(",").map((p) => p.trim());
+  const [cardUid, amountRaw, timestampRaw, driverUid, locationRaw] = parts;
 
-  let transaction_id: string | undefined;
-  let student_uid: string | undefined;
-  let amountRaw: string | undefined;
-  let timestampRaw: string | undefined;
-  let driver_uid: string | undefined;
-  let location: string | null = null;
+  if (!CARD_UID_PATTERN.test(cardUid)) return { error: "Invalid card UID" };
+  if (!AMOUNT_PATTERN.test(amountRaw)) return { error: "Invalid amount" };
 
-  if (parts.length === 5) {
-    const p1IsNum = !isNaN(parseFloat(parts[1]));
-    const p2IsTs = !isNaN(parseInt(parts[2], 10)) && parseInt(parts[2], 10) > 1000000;
+  const rawAmount = parseFloat(amountRaw);
+  if (rawAmount === 0) return { error: "Amount is zero" };
 
-    if (p1IsNum && p2IsTs) {
-
-      // v1.1.0L Ride format
-      [student_uid, amountRaw, timestampRaw, driver_uid] = parts;
-      const locationCode = parts[4].trim().toUpperCase();
-
-      // Validate location against allowed set {A, B, C}
-      if (
-        locationCode !== "A" &&
-        locationCode !== "B" &&
-        locationCode !== "C"
-      ) {
-        return {
-          error: `Invalid location code: "${parts[4]}". Expected A, B, or C`,
-        };
-      }
-      location = locationCode;
-
-      if (!timestampRaw) return { error: "Missing timestamp field" };
-      const ts = parseInt(timestampRaw, 10);
-      transaction_id = `${actualTerminalId}-${ts}-${student_uid}`;
-    } else {
-
-      // Legacy Format A
-      [transaction_id, student_uid, amountRaw, timestampRaw, driver_uid] =
-        parts;
-    }
-  } else if (parts.length >= 3 && parts.length <= 4) {
-
-    // Legacy Format B
-    [student_uid, amountRaw, timestampRaw, driver_uid] = parts;
-
-    if (!timestampRaw) return { error: "Missing timestamp field" };
-    const ts = parseInt(timestampRaw, 10);
-    transaction_id = `${actualTerminalId}-${ts}-${student_uid}`;
-  } else {
-    return { error: `Expected 3-5 CSV fields, got ${parts.length}` };
-  }
-
-  // Validate transaction_id
-  if (!transaction_id || transaction_id.length === 0) {
-    return { error: "transaction_id is empty" };
-  }
-
-  // Validate student_uid (physical NFC Card UID)
-  if (!student_uid || student_uid.length === 0) {
-    return { error: "student_uid is empty" };
-  }
-
-  // Validate amount
-  if (!amountRaw) return { error: "amount is missing" };
-  const parsedAmount = parseFloat(amountRaw);
-  if (isNaN(parsedAmount) || parsedAmount === 0) {
-    return { error: `Invalid amount: "${amountRaw}"` };
-  }
-  const amount = Math.abs(parsedAmount);
-
-  // Validate timestamp
-  if (!timestampRaw) return { error: "timestamp is missing" };
+  if (!TIMESTAMP_PATTERN.test(timestampRaw)) return { error: "Invalid timestamp" };
   const epochSeconds = parseInt(timestampRaw, 10);
-  if (isNaN(epochSeconds) || epochSeconds <= 0) {
-    return { error: `Invalid timestamp: "${timestampRaw}"` };
+
+  if (!CARD_UID_PATTERN.test(driverUid)) return { error: "Invalid driver UID" };
+
+  const location = locationRaw.toUpperCase();
+  if (location !== "A" && location !== "B" && location !== "C") {
+    return { error: "Invalid location code. Expected A, B, or C" };
   }
-  const synced_at = new Date(epochSeconds * 1000);
 
   return {
     data: {
-      transaction_id,
-      terminal_id: actualTerminalId,
-      student_uid,
-      card_uid: student_uid,
-      amount,
-      raw_amount: parsedAmount,
+      transaction_id: `${terminalId}-${epochSeconds}-${cardUid}`,
+      terminal_id: terminalId,
+      student_uid: cardUid,
+      card_uid: cardUid,
+      amount: Math.abs(rawAmount),
+      raw_amount: rawAmount,
       timestamp: epochSeconds,
-      driver_uid: driver_uid || null,
+      driver_uid: driverUid,
       location,
-      synced_at,
+      synced_at: new Date(epochSeconds * 1000),
     },
   };
 }
@@ -335,10 +273,9 @@ export function parsePendingLink(
 
   const [uid, otp, agent_uid] = parts;
 
-  if (!uid || uid.length === 0)
-    return { error: "UID is empty in PENDING_LINK" };
-  if (!otp || !/^\d{6}$/.test(otp))
-    return { error: `OTP must be 6 digits, got "${otp}"` };
+  if (!uid || !CARD_UID_PATTERN.test(uid))
+    return { error: "Invalid UID in PENDING_LINK" };
+  if (!otp || !/^\d{6}$/.test(otp)) return { error: "OTP must be 6 digits" };
   if (!agent_uid || agent_uid.length === 0)
     return { error: "agent_uid is empty in PENDING_LINK" };
 
@@ -359,7 +296,7 @@ export function parseSyncRequest(
   let deviceId = terminalId;
   let body = raw.trim();
 
-  // Format 1: SYNC_REQUEST
+  // Format 1: SYNC_REQUEST:device,[0,]timestamp,driver_uid,location
   if (body.startsWith("SYNC_REQUEST:")) {
     const after = body.substring("SYNC_REQUEST:".length).trim();
     const parts = after.split(",").map((p) => p.trim());
@@ -371,22 +308,15 @@ export function parseSyncRequest(
 
       const timestamp = parseInt(timestampRaw, 10);
       if (isNaN(timestamp) || timestamp <= 0) {
-        return { error: `Invalid timestamp in SYNC_REQUEST: "${timestampRaw}"` };
+        return { error: "Invalid timestamp in SYNC_REQUEST" };
       }
       if (!driver_uid) return { error: "driver_uid is empty in SYNC_REQUEST" };
       const location = locationRaw ? locationRaw.toUpperCase() : "";
       if (location !== "A" && location !== "B" && location !== "C") {
-        return {
-          error: `Invalid location code in SYNC_REQUEST: "${locationRaw}". Expected A, B, or C`,
-        };
+        return { error: "Invalid location code in SYNC_REQUEST. Expected A, B, or C" };
       }
       return {
-        data: {
-          device_id: deviceId,
-          timestamp,
-          driver_uid,
-          location,
-        },
+        data: { device_id: deviceId, timestamp, driver_uid, location },
       };
     }
   }
@@ -408,79 +338,24 @@ export function parseSyncRequest(
 
   const [, , timestampRaw, driver_uid, locationRaw] = parts;
 
-  // Validate timestamp
-  if (!timestampRaw) {
-    return { error: "Missing timestamp in SYNC_REQUEST" };
-  }
+  if (!timestampRaw) return { error: "Missing timestamp in SYNC_REQUEST" };
   const timestamp = parseInt(timestampRaw, 10);
   if (isNaN(timestamp) || timestamp <= 0) {
-    return { error: `Invalid timestamp in SYNC_REQUEST: "${timestampRaw}"` };
+    return { error: "Invalid timestamp in SYNC_REQUEST" };
   }
 
-  // Validate driver_uid
   if (!driver_uid || driver_uid.length === 0) {
     return { error: "driver_uid is empty in SYNC_REQUEST" };
   }
 
-  // Validate location against allowed set {A, B, C}
   const location = locationRaw ? locationRaw.toUpperCase() : "";
   if (location !== "A" && location !== "B" && location !== "C") {
-    return {
-      error: `Invalid location code in SYNC_REQUEST: "${locationRaw}". Expected A, B, or C`,
-    };
+    return { error: "Invalid location code in SYNC_REQUEST. Expected A, B, or C" };
   }
 
   return {
-    data: {
-      device_id: deviceId,
-      timestamp,
-      driver_uid,
-      location,
-    },
+    data: { device_id: deviceId, timestamp, driver_uid, location },
   };
-}
-
-export function parseDriverRegister(
-  raw: string
-): ParseResult<DriverRegisterData> {
-  let body = raw.trim();
-  if (body.includes("DRV:REG,")) {
-    body = body.substring(body.indexOf("DRV:REG,") + 8).trim();
-  }
-  const parts = body.split(",").map((p) => p.trim());
-
-  if (parts.length !== 3) {
-    return {
-      error: `DRV:REG expects 3 fields (firstname,lastname,matricNumber), got ${parts.length}`,
-    };
-  }
-
-  const [firstname, lastname, matricNumber] = parts;
-
-  if (!firstname) return { error: "firstname is empty" };
-  if (!lastname) return { error: "lastname is empty" };
-  if (!matricNumber) return { error: "matricNumber is empty" };
-
-  return { data: { firstname, lastname, matricNumber } };
-}
-
-// Downlink Command Builders & Normalizers
-export function buildFareCommand(
-  location: "A" | "B" | "C" | null,
-  amount: number
-): string {
-  if (location) {
-    return `SYS:FARE_${location},${amount}`;
-  }
-  return `SYS:FARE,${amount}`;
-}
-
-export function buildLocationCommand(location: "A" | "B" | "C"): string {
-  return `SYS:LOC,${location}`;
-}
-
-export function buildOtaCommand(url: string): string {
-  return `SYS:OTA,${url}`;
 }
 
 // Normalize legacy downlink commands

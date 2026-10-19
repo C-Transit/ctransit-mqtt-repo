@@ -19,7 +19,14 @@ const prisma = new PrismaClient({
   },
 });
 
-logger.info({ databaseUrl }, "prisma.connected_real_database");
+let databaseHost: string;
+try {
+  databaseHost = new URL(databaseUrl).host;
+} catch {
+  databaseHost = "invalid-url";
+}
+
+logger.info({ databaseHost }, "prisma.connected_real_database");
 
 export { prisma };
 export default prisma;

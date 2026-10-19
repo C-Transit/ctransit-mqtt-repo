@@ -4,8 +4,8 @@ import mqttConfig from "../config/mqtt.js";
 import logger from "../config/logger.js";
 import env from "../config/env.js";
 import { routeUplinkMessage } from "./uplinkRouter.js";
-import { injectClient, publishToTerminal } from "./downlinkQueue.js";
-import { injectMqttPublisher } from "../services/sync.service.js";
+import { injectClient } from "./downlinkQueue.js";
+import { attachGsmDownlinkForwarder } from "./gsmDownlinkForwarder.js";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let client: any = null;
@@ -25,6 +25,8 @@ function connectMqtt(): Promise<any> {
       ...mqttConfig.options,
     });
 
+    attachGsmDownlinkForwarder(client);
+
     let settled = false;
 
     const timeoutTimer = setTimeout(() => {
@@ -42,12 +44,12 @@ function connectMqtt(): Promise<any> {
 
       if (client) {
         injectClient(client);
-        injectMqttPublisher(publishToTerminal);
       }
 
       const topics: Record<string, { qos: number }> = {
         [mqttConfig.topics.uplinkWildcard]: { qos: mqttConfig.qos.uplink },
         [mqttConfig.topics.statusWildcard]: { qos: mqttConfig.qos.uplink },
+        [mqttConfig.topics.downlinkWildcard]: { qos: 1 },
       };
 
       client?.subscribe(topics, (err: Error | null, granted?: unknown[]) => {

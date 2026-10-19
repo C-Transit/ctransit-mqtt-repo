@@ -1,5 +1,6 @@
-import crypto from "crypto";
-import { prisma } from "./ledger.service.js";
+// src/services/hmac.service.ts
+import crypto from "node:crypto";
+import prisma from "../lib/prisma.js";
 import logger from "../config/logger.js";
 
 export interface HmacVerifyResult {
@@ -7,18 +8,16 @@ export interface HmacVerifyResult {
   terminalId: string;
 }
 
-// Retrieves the secret key for a given terminal from the database.
+const SIGNATURE_PATTERN = /^[0-9a-f]{64}$/i;
+
 async function getTerminalSecret(terminalId: string): Promise<string | null> {
   const terminal = await prisma.terminal.findUnique({
     where: { terminal_id: terminalId },
     select: { secret_key: true },
   });
-
-  if (!terminal) return null;
-  return terminal.secret_key;
+  return terminal ? terminal.secret_key : null;
 }
 
-// Computes the HMAC signature for a given payload using the terminal's secret key.
 function computeHmac(
   secretKey: string,
   terminalId: string,
@@ -30,7 +29,8 @@ function computeHmac(
     .digest("hex");
 }
 
-// Verifies the HMAC signature of an incoming message and unwraps the payload if valid.
+// Verifies "HMAC:<64 hex>|<payload>" and returns the payload, or null if anything is wrong.
+// Never logs the message or payload.
 async function verifyAndUnwrap(
   terminalId: string,
   rawMessage: string
@@ -39,10 +39,7 @@ async function verifyAndUnwrap(
 
   const pipeIndex = rawMessage.indexOf("|");
   if (pipeIndex === -1 || !rawMessage.startsWith("HMAC:")) {
-    log.warn(
-      { rawMessage: rawMessage.substring(0, 80) },
-      "hmac.missing_wrapper — rejecting message"
-    );
+    log.warn("hmac.missing_wrapper — rejecting message");
     return null;
   }
 
@@ -54,29 +51,24 @@ async function verifyAndUnwrap(
     return null;
   }
 
-  if (receivedSig.length !== 64) {
-    log.warn(
-      { sigLength: receivedSig.length },
-      "hmac.invalid_signature_length — rejecting"
-    );
+  // Strict hex check: a 64-character non-hex string would decode to a shorter buffer
+  // and make timingSafeEqual throw.
+  if (!SIGNATURE_PATTERN.test(receivedSig)) {
+    log.warn("hmac.invalid_signature_format — rejecting message");
     return null;
   }
 
-  // Retrieve the terminal's secret key from the database
   const secretKey = await getTerminalSecret(terminalId);
-
   if (!secretKey) {
     log.warn("hmac.terminal_not_found — rejecting message");
     return null;
   }
-
   if (secretKey === "UNPROVISIONED") {
-    log.warn("hmac.terminal_unprovisioned — rejecting non-status message");
+    log.warn("hmac.terminal_unprovisioned — rejecting message");
     return null;
   }
 
   const expectedSig = computeHmac(secretKey, terminalId, payload);
-
   const signaturesMatch = crypto.timingSafeEqual(
     Buffer.from(receivedSig, "hex"),
     Buffer.from(expectedSig, "hex")
@@ -87,13 +79,7 @@ async function verifyAndUnwrap(
     return null;
   }
 
-  log.debug({ payload: payload.substring(0, 80) }, "hmac.verified");
   return payload;
 }
 
-// No-op now — kept so admin.controller.ts import doesn't break
-// if it's still referenced anywhere. Safe to remove later.
-async function invalidateTerminalSecretCache(): Promise<void> {
-}
-
-export { verifyAndUnwrap, invalidateTerminalSecretCache, computeHmac };
+export { verifyAndUnwrap, computeHmac };

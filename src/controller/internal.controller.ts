@@ -1,90 +1,50 @@
-// src/controllers/internal.controller.ts
-import { Request, Response } from "express";
+// src/controller/internal.controller.ts
+import type { Request, Response } from "express";
 import {
   broadcastDeltaToFleet,
   routeDeltaToTerminal,
 } from "../services/sync.service.js";
+import { commandTag } from "../mqtt/downlinkQueue.js";
+import { normalizeDownlinkCommand } from "../utils/parser.js";
 import logger from "../config/logger.js";
-import { deductFare, isBelowThreshold, prisma } from '../services/ledger.service.js';
-import { buildDeltaCommand, normalizeDownlinkCommand } from '../utils/parser.js';
 
-export const testDeduct = async (req: Request, res: Response) => {
-  const { studentUid, amount, terminalId } = req.body;
+const MAX_COMMAND_LENGTH = 1000;
+const TERMINAL_ID_PATTERN = /^[A-Za-z0-9_-]{1,20}$/;
 
-  if (!studentUid || !amount || !terminalId) {
-    return res.status(400).json({ 
-      error: 'Missing fields: studentUid, amount, terminalId' 
-    });
-  }
+const errText = (err: unknown): string =>
+  err instanceof Error ? err.message : "Unknown error";
 
-  // 1. Get the card UID for this student
-  const cardMap = await prisma.cardMapping.findUnique({
-    where: { student_uid: studentUid },
-    select: { card_uid: true }
-  });
-  if (!cardMap) {
-    return res.status(404).json({ error: 'No card linked to this student' });
-  }
-  const cardUid = cardMap.card_uid;
-
-  // 2. Perform deduction (this updates balance)
-  const result = await deductFare(
-    studentUid,
-    amount,
-    `TEST-${Date.now()}`,
-    prisma
-  );
-
-  if (!result.walletFound) {
-    return res.status(404).json({ error: 'Wallet not found' });
-  }
-
-  const newBalance = result.newBalance!;
-  const log = logger.child({ studentUid, cardUid, newBalance, terminalId });
-
-  // 3. Check if below threshold
-  if (isBelowThreshold(newBalance)) {
-    log.info('test.balance_below_threshold — blacklisting');
-
-    // Add to blacklist DB
-    await prisma.blacklist.upsert({
-      where: { student_uid: studentUid },
-      update: { blacklistedAt: new Date() },
-      create: { student_uid: studentUid, reason: 'LOW_BALANCE' },
-    });
-    
-    // Broadcast to all terminals
-    const command = buildDeltaCommand('ADD', 'BL', cardUid);
-    await broadcastDeltaToFleet(command);
-    log.info({ command }, 'test.blacklist_broadcast_sent');
-    return res.json({
-      success: true,
-      newBalance,
-      blacklisted: true,
-      command,
-    });
-  } else {
-    log.info('test.balance_above_threshold — no blacklist');
-    return res.json({
-      success: true,
-      newBalance,
-      blacklisted: false,
-    });
-  }
-};
+// Returns the cleaned command, or null if it is missing or unreasonable.
+function readCommand(body: unknown): string | null {
+  const raw = (body as { command?: unknown } | undefined)?.command;
+  if (typeof raw !== "string") return null;
+  const command = normalizeDownlinkCommand(raw);
+  if (command.length === 0 || command.length > MAX_COMMAND_LENGTH) return null;
+  return command;
+}
 
 export const handleBroadcast = async (req: Request, res: Response) => {
-  const { command: rawCommand } = req.body;
-  if (!rawCommand || typeof rawCommand !== "string") {
+  const command = readCommand(req.body);
+  if (!command) {
     return res
       .status(400)
       .json({ error: 'Missing or invalid "command" field' });
   }
 
-  const command = normalizeDownlinkCommand(rawCommand);
-  logger.debug({ command }, "internal.broadcast_request");
-  await broadcastDeltaToFleet(command);
-  res.json({ success: true, command });
+  // Commands can contain PINs, so only the type is ever logged or returned.
+  const commandType = commandTag(command);
+
+  try {
+    logger.debug({ command: commandType }, "internal.broadcast_request");
+    const summary = await broadcastDeltaToFleet(command);
+    return res.json({ success: true, commandType, summary });
+  } catch (err) {
+    logger.error(
+      { command: commandType, err: errText(err) },
+      "internal.broadcast_failed"
+    );
+    return res.status(502).json({ success: false, error: "BROADCAST_FAILED" });
+  }
 };
 
 export const handleRoute = async (req: Request, res: Response) => {
@@ -92,58 +52,37 @@ export const handleRoute = async (req: Request, res: Response) => {
   const terminalId = Array.isArray(terminalIdRaw)
     ? terminalIdRaw[0]
     : terminalIdRaw;
-  const { command: rawCommand } = req.body;
 
-  if (!rawCommand || typeof rawCommand !== "string") {
+  if (!terminalId || !TERMINAL_ID_PATTERN.test(terminalId)) {
+    return res.status(400).json({ error: "Missing or invalid terminalId in path" });
+  }
+
+  const command = readCommand(req.body);
+  if (!command) {
     return res
       .status(400)
       .json({ error: 'Missing or invalid "command" field' });
   }
-
-  if (!terminalId) {
-    return res.status(400).json({ error: "Missing terminalId in path" });
+  
+  const commandType = commandTag(command);
+  const normId = terminalId.toUpperCase();
+  
+  if (normId === "SYSTEM_TERMINAL") {
+    return res.status(400).json({ error: "SYSTEM_TERMINAL is not a physical terminal" });
   }
 
-  const command = normalizeDownlinkCommand(rawCommand);
-  logger.debug({ terminalId, command }, "internal.route_request");
-  await routeDeltaToTerminal(terminalId, command);
-  res.json({ success: true, terminalId, command });
-};
-
-export const testBlacklistRemoval = async (req: Request, res: Response) => {
-  const { studentUid } = req.body;
-
-  if (!studentUid) {
-    return res.status(400).json({ error: "Missing studentUid" });
+  try {
+    logger.debug(
+      { terminalId: normId, command: commandType },
+      "internal.route_request"
+    );
+    await routeDeltaToTerminal(normId, command);
+    return res.json({ success: true, terminalId: normId, commandType });
+  } catch (err) {
+    logger.error(
+      { terminalId: normId, command: commandType, err: errText(err) },
+      "internal.route_failed"
+    );
+    return res.status(502).json({ success: false, error: "ROUTE_FAILED" });
   }
-
-  // Get card UID
-  const cardMap = await prisma.cardMapping.findUnique({
-    where: { student_uid: studentUid },
-    select: { card_uid: true },
-  });
-
-  if (!cardMap) {
-    return res.status(404).json({ error: "No card linked to this student" });
-  }
-
-  // Broadcast REM:BL
-  const command = buildDeltaCommand("REM", "BL", cardMap.card_uid);
-  await broadcastDeltaToFleet(command);
-
-  // Remove from DB
-  await prisma.blacklist.deleteMany({
-    where: { student_uid: studentUid },
-  });
-
-  logger.info(
-    { studentUid, cardUid: cardMap.card_uid, command },
-    "test.blacklist_removed"
-  );
-
-  res.json({
-    success: true,
-    cardUid: cardMap.card_uid,
-    command,
-  });
 };

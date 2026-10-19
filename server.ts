@@ -4,10 +4,9 @@ import "./src/config/env.js";
 
 import http from "http";
 import express from "express";
-import cors from "cors";
 import morgan from "morgan";
 import { connectMqtt, disconnectMqtt } from "./src/mqtt/client.js";
-import { getRedisClient, waitForRedisReady } from "./src/config/redis.js";
+import { getRedisClient } from "./src/config/redis.js";
 import { prisma } from "./src/lib/prisma.js";
 import healthRouter from "./src/routes/health.routes.js";
 import internalRouter from "./src/routes/internal.routes.js";
@@ -15,12 +14,12 @@ import logger from "./src/config/logger.js";
 import env from "./src/config/env.js";
 
 const app = express();
+app.set("trust proxy", 1);
 const port = env.PORT;
 const morganFormat = env.NODE_ENV === "production" ? "combined" : "dev";
 
 app.use(morgan(morganFormat));
 app.use(express.json());
-app.use(cors());
 
 // Health route
 app.use("/health", healthRouter);
@@ -50,7 +49,6 @@ async function boot(): Promise<void> {
 
   try {
     const redis = getRedisClient();
-    await waitForRedisReady(redis);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (redis as any).ping();
     logger.info("mqtt_service.redis_ready");
@@ -108,7 +106,7 @@ async function boot(): Promise<void> {
   logger.info("mqtt_service.boot_complete");
 }
 
-async function shutdown(signal: string): Promise<void> {
+async function shutdown(signal: string, exitCode = 0): Promise<void> {
   if (isShuttingDown) return;
   isShuttingDown = true;
 
@@ -149,7 +147,7 @@ async function shutdown(signal: string): Promise<void> {
   }
 
   logger.info("mqtt_service.shutdown_complete");
-  process.exit(0);
+  process.exit(exitCode);
 }
 
 process.on("SIGTERM", () => shutdown("SIGTERM"));
@@ -161,7 +159,7 @@ process.on("unhandledRejection", (reason: unknown) => {
 
 process.on("uncaughtException", (err: Error) => {
   logger.fatal({ err: err.message }, "mqtt_service.uncaught_exception");
-  shutdown("uncaughtException");
+  shutdown("uncaughtException", 1);
 });
 
 boot();
