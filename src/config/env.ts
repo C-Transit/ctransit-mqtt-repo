@@ -26,6 +26,8 @@ const REQUIRED_VARS = [
   "HIVEMQ_PORT",
   "HIVEMQ_CLIENT_ID",
   "MQTT_INTERNAL_SECRET",
+  "WORKER_WEBHOOK_URL",
+  "WORKER_WEBHOOK_SECRET",
 ] as const;
 
 const isProduction = process.env.NODE_ENV === "production";
@@ -91,6 +93,13 @@ interface Config {
   terminals: {
     autoRegister: boolean;
   };
+  cmdWrap: {
+    terminals: string[];
+  };
+  worker: {
+    webhookUrl: string;
+    webhookSecret: string;
+  };
 }
 
 const env: Config = {
@@ -117,6 +126,16 @@ const env: Config = {
   terminals: {
     // Set AUTO_REGISTER_TERMINALS=false once every real terminal exists in the database.
     autoRegister: process.env.AUTO_REGISTER_TERMINALS !== "false",
+  },
+  cmdWrap: {
+    terminals: (process.env.CMD_WRAP_TERMINALS ?? "")
+      .split(",")
+      .map((id) => id.trim().toUpperCase())
+      .filter((id) => id.length > 0),
+  },
+  worker: {
+    webhookUrl: process.env.WORKER_WEBHOOK_URL as string,
+    webhookSecret: process.env.WORKER_WEBHOOK_SECRET as string,
   },
 };
 

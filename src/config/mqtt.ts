@@ -7,6 +7,7 @@ interface MqttConfig {
   topics: {
     uplinkWildcard: string;
     statusWildcard: string;
+    downlinkWildcard: string;
     downlink: (terminalId: string | number) => string;
   };
   qos: {
@@ -40,6 +41,7 @@ const mqttConfig: MqttConfig = {
   topics: {
     uplinkWildcard: "ctransit/+/tx",
     statusWildcard: "ctransit/+/status",
+    downlinkWildcard: "ctransit/+/rx",
     downlink: (terminalId: string | number): string =>
       `ctransit/${terminalId}/rx`,
   },
