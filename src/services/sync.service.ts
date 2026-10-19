@@ -1,11 +1,45 @@
 // src/services/sync.service.ts
 "use strict";
 
+import { randomBytes } from "node:crypto";
 import { getRedisClient, redisKeys } from "../config/redis.js";
 import logger from "../config/logger.js";
 import prisma from "../lib/prisma.js";
+import env from "../config/env.js";
 import { buildChunks } from "../utils/parser.js";
 import { publishToTerminal, commandTag } from "../mqtt/downlinkQueue.js";
+
+// Only these commands may be wrapped for GSM delivery on enabled terminals.
+const WRAP_PREFIXES = [
+  "SYS:FARE,",
+  "SYS:FARE_A,",
+  "SYS:FARE_B,",
+  "SYS:FARE_C,",
+  "SYS:LOC,",
+  "SYS:TIME,",
+  "SYS:NET,",
+  "ADD:WL,",
+  "REM:WL,",
+  "ADD:BL,",
+  "REM:BL,",
+];
+const WRAP_EXACT = ["SYS:SYNC_COMPLETE"];
+const WRAPPED = /^CMD:([0-9a-f]{12});([\s\S]*)$/;
+
+export function innerPayload(command: string): string {
+  const m = WRAPPED.exec(command);
+  return m ? m[2] : command;
+}
+
+export function buildCommand(terminalId: string, command: string): string {
+  if (WRAPPED.test(command)) return command;
+  const ok =
+    WRAP_EXACT.includes(command) ||
+    WRAP_PREFIXES.some((p) => command.startsWith(p));
+  if (!ok) return command;
+  if (!env.cmdWrap.terminals.includes(terminalId.toUpperCase())) return command;
+  return `CMD:${randomBytes(6).toString("hex")};${command}`;
+}
 
 // Commands that describe a single current setting: only the newest one matters.
 const STATE_PREFIXES = [
@@ -15,6 +49,8 @@ const STATE_PREFIXES = [
   "SYS:FARE_B,",
   "SYS:FARE_C,",
   "SYS:OTA,",
+  "SYS:TIME,",
+  "SYS:NET,",
 ];
 
 // "ADD:BL,uid" / "REM:BL,uid" / "ADD:DR,uid,pin" -> "BL:uid" / "DR:uid".
@@ -40,12 +76,13 @@ async function enqueueTerminalCommand(
     const multi = redis.multi();
     let replaced = 0;
 
-    const matchingPrefix = STATE_PREFIXES.find((p) => command.startsWith(p));
-    const newKey = deltaKey(command);
+    const inner = innerPayload(command);
+    const matchingPrefix = STATE_PREFIXES.find((p) => inner.startsWith(p));
+    const newKey = deltaKey(inner);
 
     if (matchingPrefix) {
       for (const item of existing) {
-        if (item.startsWith(matchingPrefix)) {
+        if (innerPayload(item).startsWith(matchingPrefix)) {
           multi.lrem(queueKey, 0, item);
           replaced++;
         }
@@ -53,12 +90,12 @@ async function enqueueTerminalCommand(
     } else if (newKey) {
       // Last writer wins: drop older commands about the same card, then add the new one.
       for (const item of existing) {
-        if (deltaKey(item) === newKey) {
+        if (deltaKey(innerPayload(item)) === newKey) {
           multi.lrem(queueKey, 0, item);
           replaced++;
         }
       }
-    } else if (existing.includes(command)) {
+    } else if (existing.some((item) => innerPayload(item) === inner)) {
       logger.debug(
         { terminalId: normId, command: tag },
         "sync.enqueue_skipped_duplicate — command already queued"
@@ -95,10 +132,11 @@ async function routeDeltaToTerminal(
   deltaCommand: string
 ): Promise<void> {
   const normId = terminalId.toUpperCase();
+  const command = buildCommand(normId, deltaCommand);
   const redis = getRedisClient();
   const log = logger.child({
     terminalId: normId,
-    command: commandTag(deltaCommand),
+    command: commandTag(command),
   });
   const queueKey = redisKeys.terminalQueue(normId);
 
@@ -110,7 +148,7 @@ async function routeDeltaToTerminal(
 
     if (!terminal) {
       log.warn("sync.terminal_not_in_db — queuing delta");
-      await enqueueTerminalCommand(normId, deltaCommand);
+      await enqueueTerminalCommand(normId, command);
       return;
     }
 
@@ -119,7 +157,7 @@ async function routeDeltaToTerminal(
     // Online and nothing waiting: send straight away.
     if (terminal.status === "ONLINE" && pendingCount === 0) {
       try {
-        await publishToTerminal(normId, deltaCommand);
+        await publishToTerminal(normId, command);
         log.info("sync.delta_published_direct");
         return;
       } catch (pubErr) {
@@ -129,13 +167,13 @@ async function routeDeltaToTerminal(
           { err: errMsg },
           "sync.delta_direct_publish_failed — queuing command for retry"
         );
-        await enqueueTerminalCommand(normId, deltaCommand);
+        await enqueueTerminalCommand(normId, command);
         return;
       }
     }
 
     // Offline, or older commands are waiting: queue it to keep the order.
-    await enqueueTerminalCommand(normId, deltaCommand);
+    await enqueueTerminalCommand(normId, command);
     log.info(
       { terminalStatus: terminal.status, pendingCount },
       "sync.delta_queued_redis"
@@ -151,7 +189,7 @@ async function routeDeltaToTerminal(
     log.error({ err: errMsg }, "sync.route_delta_error — queuing as fallback");
     // If Redis is also down this throws, so the caller learns the command was
     // neither sent nor saved.
-    await enqueueTerminalCommand(normId, deltaCommand);
+    await enqueueTerminalCommand(normId, command);
   }
 }
 
@@ -183,6 +221,7 @@ async function broadcastDeltaToFleet(deltaCommand: string): Promise<BroadcastSum
     terminals.map(async (t: { terminal_id: string; status: string }) => {
       const id = t.terminal_id.toUpperCase();
       const online = t.status === "ONLINE";
+      const command = buildCommand(id, deltaCommand);
 
       try {
         const pending = online
@@ -191,7 +230,7 @@ async function broadcastDeltaToFleet(deltaCommand: string): Promise<BroadcastSum
 
         if (online && pending === 0) {
           try {
-            await publishToTerminal(id, deltaCommand);
+            await publishToTerminal(id, command);
             summary.deliveredCount++;
             return;
           } catch (err) {
@@ -202,7 +241,7 @@ async function broadcastDeltaToFleet(deltaCommand: string): Promise<BroadcastSum
           }
         }
 
-        await enqueueTerminalCommand(id, deltaCommand);
+        await enqueueTerminalCommand(id, command);
         summary.queuedCount++;
 
         if (online) {
@@ -361,7 +400,10 @@ async function syncFullListsToTerminal(terminalId: string): Promise<void> {
     await sleep(SYNC_DELAY_MS);
 
     // 4. Signal completion
-    await publishToTerminal(terminalId, "SYS:SYNC_COMPLETE");
+    await publishToTerminal(
+      terminalId,
+      buildCommand(terminalId, "SYS:SYNC_COMPLETE")
+    );
     log.info("sync.full_sync_complete");
   } catch (error) {
     const errMessage =
