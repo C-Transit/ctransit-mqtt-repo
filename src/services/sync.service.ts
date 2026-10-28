@@ -26,19 +26,61 @@ const WRAP_PREFIXES = [
 const WRAP_EXACT = ["SYS:SYNC_COMPLETE"];
 const WRAPPED = /^CMD:([0-9a-f]{12});([\s\S]*)$/;
 
+function safeWorkerHost(): string | null {
+  try {
+    return env.worker.webhookUrl ? new URL(env.worker.webhookUrl).host : null;
+  } catch {
+    return env.worker.webhookUrl ? "invalid-url" : null;
+  }
+}
+
 export function innerPayload(command: string): string {
   const m = WRAPPED.exec(command);
   return m ? m[2] : command;
 }
 
 export function buildCommand(terminalId: string, command: string): string {
+  const normalizedTerminalId = terminalId.toUpperCase();
+
   if (WRAPPED.test(command)) return command;
-  const ok =
+
+  const eligible =
     WRAP_EXACT.includes(command) ||
     WRAP_PREFIXES.some((p) => command.startsWith(p));
-  if (!ok) return command;
-  if (!env.cmdWrap.terminals.includes(terminalId.toUpperCase())) return command;
-  return `CMD:${randomBytes(6).toString("hex")};${command}`;
+
+  if (!eligible) return command;
+
+  const gsmEnabled = env.cmdWrap.terminals.includes(normalizedTerminalId);
+  if (!gsmEnabled) {
+    logger.debug(
+      {
+        terminalId: normalizedTerminalId,
+        command: commandTag(command),
+        reason: "terminal_not_in_cmd_wrap_list",
+        enabledTerminals: env.cmdWrap.terminals,
+      },
+      "sync.command_not_wrapped_for_gsm"
+    );
+    return command;
+  }
+
+  if (!env.worker.webhookUrl || !env.worker.webhookSecret) {
+    throw new Error(
+      `GSM wrap is enabled for terminal ${normalizedTerminalId} but WORKER_WEBHOOK_URL / WORKER_WEBHOOK_SECRET are missing.`
+    );
+  }
+
+  const wrapped = `CMD:${randomBytes(6).toString("hex")};${command}`;
+  logger.info(
+    {
+      terminalId: normalizedTerminalId,
+      command: commandTag(command),
+      wrappedCommand: commandTag(wrapped),
+      workerHost: safeWorkerHost(),
+    },
+    "sync.command_wrapped_for_gsm"
+  );
+  return wrapped;
 }
 
 // Commands that describe a single current setting: only the newest one matters.

@@ -2,11 +2,20 @@ import type { MqttClient } from "mqtt";
 import env from "../config/env.js";
 import type { Logger } from "pino";
 import logger from "../config/logger.js";
+import { commandTag } from "./downlinkQueue.js";
 
 const POST_TIMEOUT_MS = 5000;
 const MAX_ATTEMPTS = 3;
 const BACKOFF_BASE_MS = 500;
 const CMD_PATTERN = /^CMD:([0-9a-f]{12});/;
+
+function workerHost(): string | null {
+  try {
+    return env.worker.webhookUrl ? new URL(env.worker.webhookUrl).host : null;
+  } catch {
+    return env.worker.webhookUrl ? "invalid-url" : null;
+  }
+}
 
 type PostResult = { done: boolean; retry: boolean; reason: string };
 
@@ -18,20 +27,36 @@ function terminalIdFromTopic(topic: string): string | null {
 }
 
 async function postToWorker(terminalId: string, commandCsv: string): Promise<PostResult> {
+  const tag = commandTag(commandCsv);
+  const webhookUrl = env.worker.webhookUrl?.trim();
+  const webhookSecret = env.worker.webhookSecret?.trim();
+
+  if (!webhookUrl || !webhookSecret) {
+    const missing: string[] = [];
+    if (!webhookUrl) missing.push("WORKER_WEBHOOK_URL");
+    if (!webhookSecret) missing.push("WORKER_WEBHOOK_SECRET");
+    return {
+      done: false,
+      retry: false,
+      reason: `config_missing:${missing.join(",")}`,
+    };
+  }
+
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), POST_TIMEOUT_MS);
   try {
-    const res = await fetch(env.worker.webhookUrl, {
+    const res = await fetch(webhookUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "X-Worker-Secret": env.worker.webhookSecret,
+        "X-Worker-Secret": webhookSecret,
       },
       body: JSON.stringify({ validatorId: terminalId, commandCsv }),
       signal: controller.signal,
     });
     const body = await res.text().catch(() => "");
     if (res.ok || body.includes("ALREADY_QUEUED")) {
+      logger.debug({ terminalId, command: tag, webHookHost: workerHost() }, "gsm_downlink.worker_post_ok");
       return { done: true, retry: false, reason: "ok" };
     }
     if (res.status >= 400 && res.status < 500) {
@@ -58,15 +83,40 @@ async function forwardWithRetry(
       return;
     }
     if (!r.retry) {
-      log.error({ attempt, reason: r.reason }, "gsm_downlink.rejected_by_worker");
+      log.error(
+        {
+          attempt,
+          reason: r.reason,
+          workerConfigured: Boolean(env.worker.webhookUrl && env.worker.webhookSecret),
+          workerHost: workerHost(),
+        },
+        "gsm_downlink.rejected_by_worker"
+      );
       return;
     }
     if (attempt === MAX_ATTEMPTS) break;
     const backoffMs = BACKOFF_BASE_MS * 2 ** (attempt - 1);
-    log.warn({ attempt, reason: r.reason, backoffMs }, "gsm_downlink.retry_scheduled");
+    log.warn(
+      {
+        attempt,
+        reason: r.reason,
+        backoffMs,
+        workerHost: workerHost(),
+      },
+      "gsm_downlink.retry_scheduled"
+    );
     await new Promise((resolve) => setTimeout(resolve, backoffMs));
   }
-  log.error({ attempts: MAX_ATTEMPTS }, "gsm_downlink.forward_failed_permanently");
+  log.error(
+    {
+      attempts: MAX_ATTEMPTS,
+      workerConfigured: Boolean(env.worker.webhookUrl && env.worker.webhookSecret),
+      workerHost: workerHost(),
+      terminalId,
+      commandTag: commandTag(commandCsv),
+    },
+    "gsm_downlink.forward_failed_permanently"
+  );
 }
 
 // One command at a time per terminal, so ADD:BL then REM:BL never swap order.
@@ -92,9 +142,15 @@ export function attachGsmDownlinkForwarder(client: MqttClient): void {
       terminalId,
       commandId: match[1],
       commandLength: commandCsv.length,
+      workerConfigured: Boolean(env.worker.webhookUrl && env.worker.webhookSecret),
+      workerHost: workerHost(),
     });
     log.info("gsm_downlink.received");
     runInOrder(terminalId, () => forwardWithRetry(terminalId, commandCsv, log));
   });
-  logger.info("gsm_downlink.forwarder_attached");
+  logger.info({
+    workerConfigured: Boolean(env.worker.webhookUrl && env.worker.webhookSecret),
+    workerHost: workerHost(),
+    enabledTerminals: env.cmdWrap.terminals,
+  }, "gsm_downlink.forwarder_attached");
 }

@@ -8,9 +8,8 @@
     "build": "node api.js && tsc",
     "start": "node api.js && node server.ts",
     "dev": "node api.js && tsx server.ts",
-    "lint": "eslint src --ext .ts,.tsx",
-    "test:phase4": "tsx test/v1_1_0L_phase4_failure_validation.test.ts",
-    "test": "tsx test/settlement.test.ts && tsx test/security.test.ts && tsx test/reliability.test.ts && tsx test/v1_1_0L_uplink.test.ts && tsx test/v1_1_0L_financial_integration.test.ts && tsx test/v1_1_0L_phase4_failure_validation.test.ts"
+    "full-sync": "tsx scripts/full-sync.ts",
+    "lint": "eslint src --ext .ts,.tsx"
   },
   "keywords": [],
   "author": "",

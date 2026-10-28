@@ -69,6 +69,13 @@ if (isProduction) {
   }
 }
 
+function parseGsmTerminalList(raw: string): string[] {
+  return raw
+    .split(",")
+    .map((id) => id.trim().toUpperCase())
+    .filter((id) => id.length > 0);
+}
+
 interface Config {
   NODE_ENV: string;
   PORT: number;
@@ -128,10 +135,7 @@ const env: Config = {
     autoRegister: process.env.AUTO_REGISTER_TERMINALS !== "false",
   },
   cmdWrap: {
-    terminals: (process.env.CMD_WRAP_TERMINALS ?? "")
-      .split(",")
-      .map((id) => id.trim().toUpperCase())
-      .filter((id) => id.length > 0),
+    terminals: parseGsmTerminalList(process.env.CMD_WRAP_TERMINALS ?? ""),
   },
   worker: {
     webhookUrl: process.env.WORKER_WEBHOOK_URL as string,
