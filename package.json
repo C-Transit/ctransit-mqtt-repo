@@ -1,7 +1,7 @@
 {
   "name": "ctransit-mqtt",
   "version": "1.0.0",
-  "description": "CTransit MQTT microservice \u2014 terminal communication layer",
+  "description": "CTransit MQTT microservice — terminal communication layer",
   "main": "index.js",
   "scripts": {
     "postinstall": "prisma generate",
@@ -23,6 +23,7 @@
     "dotenv": "^17.3.1",
     "express": "^5.2.1",
     "ioredis": "^5.10.1",
+    "jiti": "^2.7.0",
     "morgan": "^1.10.1",
     "mqtt": "^5.15.1",
     "pino": "^10.3.1",
@@ -38,5 +39,15 @@
     "prisma": "^6.12.0",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.61.0"
+  },
+  "overrides": {
+    "minimatch": "^11.0.1",
+    "deepmerge-ts": "^8.0.1"
+  },
+  "allowScripts": {
+    "@prisma/client": true,
+    "@prisma/engines": true,
+    "esbuild": true,
+    "prisma": true
   }
 }
