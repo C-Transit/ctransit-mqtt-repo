@@ -8,9 +8,10 @@ outbox entry is removed only after the Worker acknowledges it. Other terminals
 continue to use the MQTT downlink queue and are flushed when they come online.
 
 The service sends the Worker a JSON POST with `validatorId`, `commandCsv`, and
-`deliveryId`, plus the `X-Worker-Secret` header. The Worker must durably accept
-the command before returning HTTP success with a JSON body containing
-`{"puback":true,"deliveryId":"<same deliveryId>"}`. The `deliveryId` is stable
-across retries; the Worker must deduplicate repeated delivery IDs and return
-the same PUBACK for a command it has already accepted. Responses without a
-valid PUBACK are retried every five seconds.
+`deliveryId`, plus the `X-Worker-Secret` header. The Worker must durably store
+the command before returning HTTP success with
+`{"accepted":true,"deliveryId":"<same deliveryId>"}`. The `deliveryId` is
+stable across retries so the Worker can deduplicate repeated requests. The
+backend also accepts the deployed Worker’s legacy `OK` and `ALREADY_QUEUED`
+plain-text responses. Responses without a valid acknowledgment are retried
+every five seconds.

@@ -59,24 +59,40 @@ async function postToWorker(item: GsmOutboxItem): Promise<boolean> {
       signal: controller.signal,
     });
     const body = await res.text();
-    let response: { puback?: unknown; deliveryId?: unknown } | null = null;
+    let response:
+      | { accepted?: unknown; puback?: unknown; deliveryId?: unknown }
+      | null = null;
     try {
-      response = JSON.parse(body) as { puback?: unknown; deliveryId?: unknown };
+      response = JSON.parse(body) as {
+        accepted?: unknown;
+        puback?: unknown;
+        deliveryId?: unknown;
+      };
     } catch {
       response = null;
     }
 
     const acknowledged =
       res.ok &&
-      response?.puback === true &&
-      response.deliveryId === item.deliveryId;
+      ((response?.accepted === true &&
+        response.deliveryId === item.deliveryId) ||
+        (response?.puback === true &&
+          response.deliveryId === item.deliveryId) ||
+        body.trim() === "OK" ||
+        body.trim() === "ALREADY_QUEUED");
     if (acknowledged) {
       logger.info({
         terminalId: item.terminalId,
         deliveryId: item.deliveryId,
         command: commandTag(item.commandCsv),
         workerHost: workerHost(),
-      }, "gsm_downlink.puback_received");
+        acknowledgement:
+          response?.accepted === true
+            ? "explicit"
+            : response?.puback === true
+              ? "puback"
+              : "legacy",
+      }, "gsm_downlink.worker_acknowledged");
       return true;
     }
 
@@ -86,9 +102,10 @@ async function postToWorker(item: GsmOutboxItem): Promise<boolean> {
       command: commandTag(item.commandCsv),
       workerHost: workerHost(),
       status: res.status,
-      pubackReceived: response?.puback === true,
+      workerAccepted:
+        response?.accepted === true || response?.puback === true,
       acknowledgementIdMatches: response?.deliveryId === item.deliveryId,
-    }, "gsm_downlink.puback_missing_retrying");
+    }, "gsm_downlink.worker_ack_missing_retrying");
     return false;
   } catch (err) {
     logger.warn({
