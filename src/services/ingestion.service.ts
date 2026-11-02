@@ -13,7 +13,7 @@ import {
   type ParsedTransaction,
 } from "../utils/parser.js";
 import { broadcastDeltaToFleet } from "./sync.service.js";
-import { publishToTerminal } from "../mqtt/downlinkQueue.js";
+import { routeDownlinkToTerminal } from "../mqtt/downlinkQueue.js";
 
 type LoggerInstance = typeof logger;
 
@@ -50,7 +50,7 @@ async function sendAck(
   log: LoggerInstance
 ): Promise<void> {
   try {
-    await publishToTerminal(terminalId, ack);
+    await routeDownlinkToTerminal(terminalId, ack);
   } catch (err) {
     // The charge (if any) is already committed. The terminal will resend and get a DUPLICATE OK.
     log.error({ err: errText(err) }, "ingestion.ack_publish_failed");
@@ -75,7 +75,7 @@ async function ingestTransactionBatch(
     for (const item of invalid) {
       const firstToken = item.line.split(",")[0]?.trim();
       if (firstToken && firstToken.length > 0 && !firstToken.includes(":")) {
-        publishToTerminal(
+        routeDownlinkToTerminal(
           terminalId,
           `ACK:FAIL,${firstToken},MALFORMED_PAYLOAD`
         ).catch((err) => {

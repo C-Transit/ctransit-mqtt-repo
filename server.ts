@@ -12,6 +12,10 @@ import healthRouter from "./src/routes/health.routes.js";
 import internalRouter from "./src/routes/internal.routes.js";
 import logger from "./src/config/logger.js";
 import env from "./src/config/env.js";
+import {
+  startGsmDownlinkForwarder,
+  stopGsmDownlinkForwarder,
+} from "./src/mqtt/gsmDownlinkForwarder.js";
 
 const app = express();
 app.set("trust proxy", 1);
@@ -53,6 +57,7 @@ async function boot(): Promise<void> {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (redis as any).ping();
     logger.info("mqtt_service.redis_ready");
+    await startGsmDownlinkForwarder();
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
     if (env.NODE_ENV === "production") {
@@ -119,6 +124,7 @@ async function shutdown(signal: string, exitCode = 0): Promise<void> {
     keepAliveInterval = null;
   }
 
+  stopGsmDownlinkForwarder();
   server.close();
 
   try {

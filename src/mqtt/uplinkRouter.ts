@@ -16,7 +16,7 @@ import { handleLwtEvent } from "../mqtt/lwtHandler.js";
 
 import logger from "../config/logger.js";
 import type { Logger } from "pino";
-import { publishToTerminal } from "./downlinkQueue.js";
+import { routeDownlinkToTerminal } from "./downlinkQueue.js";
 import {
   handleDriverLogin,
   handleDriverLogout,
@@ -209,15 +209,15 @@ async function handleDriverEvent(
     const result = await handleDriverLogin(terminalId, driverUid as string);
 
     if (result.success) {
-      await publishToTerminal(terminalId, `DRV:OK,${result.driverName}`);
+      await routeDownlinkToTerminal(terminalId, `DRV:OK,${result.driverName}`);
       log.info({ driverUid }, "uplink.driver_login_success");
     } else {
-      await publishToTerminal(terminalId, `DRV:FAIL,${result.message}`);
+      await routeDownlinkToTerminal(terminalId, `DRV:FAIL,${result.message}`);
       log.warn({ driverUid }, "uplink.driver_login_failed");
     }
   } else if (action === "LOGOUT") {
     await handleDriverLogout(terminalId, driverUid as string);
-    await publishToTerminal(terminalId, "DRV:BYE");
+    await routeDownlinkToTerminal(terminalId, "DRV:BYE");
     log.info({ driverUid }, "uplink.driver_logout");
   }
 }

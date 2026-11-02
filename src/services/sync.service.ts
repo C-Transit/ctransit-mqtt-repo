@@ -7,7 +7,11 @@ import logger from "../config/logger.js";
 import prisma from "../lib/prisma.js";
 import env from "../config/env.js";
 import { buildChunks } from "../utils/parser.js";
-import { publishToTerminal, commandTag } from "../mqtt/downlinkQueue.js";
+import {
+  routeDownlinkToTerminal,
+  publishToTerminal,
+  commandTag,
+} from "../mqtt/downlinkQueue.js";
 
 // Only these commands may be wrapped for GSM delivery on enabled terminals.
 const WRAP_PREFIXES = [
@@ -81,6 +85,18 @@ export function buildCommand(terminalId: string, command: string): string {
     "sync.command_wrapped_for_gsm"
   );
   return wrapped;
+}
+
+function isGsmTerminal(terminalId: string): boolean {
+  return env.cmdWrap.terminals.includes(terminalId.toUpperCase());
+}
+
+async function sendCommandToTerminal(
+  terminalId: string,
+  rawCommand: string
+): Promise<void> {
+  const command = buildCommand(terminalId, rawCommand);
+  await routeDownlinkToTerminal(terminalId, command);
 }
 
 // Commands that describe a single current setting: only the newest one matters.
@@ -175,6 +191,11 @@ async function routeDeltaToTerminal(
 ): Promise<void> {
   const normId = terminalId.toUpperCase();
   const command = buildCommand(normId, deltaCommand);
+  if (isGsmTerminal(normId)) {
+    await routeDownlinkToTerminal(normId, command);
+    return;
+  }
+
   const redis = getRedisClient();
   const log = logger.child({
     terminalId: normId,
@@ -239,6 +260,7 @@ export interface BroadcastSummary {
   totalTerminals: number;
   deliveredCount: number; // published directly
   queuedCount: number; // stored in Redis, delivered on reconnect
+  workerQueuedCount: number; // stored in the Cloudflare delivery outbox
   failedTerminals: string[]; // neither published nor queued
 }
 
@@ -256,6 +278,7 @@ async function broadcastDeltaToFleet(deltaCommand: string): Promise<BroadcastSum
     totalTerminals: terminals.length,
     deliveredCount: 0,
     queuedCount: 0,
+    workerQueuedCount: 0,
     failedTerminals: [],
   };
 
@@ -266,6 +289,12 @@ async function broadcastDeltaToFleet(deltaCommand: string): Promise<BroadcastSum
       const command = buildCommand(id, deltaCommand);
 
       try {
+        if (isGsmTerminal(id)) {
+          await routeDownlinkToTerminal(id, command);
+          summary.workerQueuedCount++;
+          return;
+        }
+
         const pending = online
           ? await redis.llen(redisKeys.terminalQueue(id)).catch(() => -1)
           : -1;
@@ -409,11 +438,11 @@ async function syncFullListsToTerminal(terminalId: string): Promise<void> {
 
     // 2. Send BL first
     if (blacklistUids.length === 0) {
-      await publishToTerminal(terminalId, "SYS:BL,EMPTY");
+      await sendCommandToTerminal(terminalId, "SYS:BL,EMPTY");
     } else {
       const blChunks = buildChunks("SYS:BL,", blacklistUids, MAX_CHUNK_BYTES);
       for (let i = 0; i < blChunks.length; i++) {
-        await publishToTerminal(terminalId, blChunks[i]);
+        await sendCommandToTerminal(terminalId, blChunks[i]);
         log.debug(
           { chunk: i + 1, total: blChunks.length },
           "sync.bl_chunk_sent"
@@ -426,11 +455,11 @@ async function syncFullListsToTerminal(terminalId: string): Promise<void> {
 
     // 3. Send WL
     if (whitelistUids.length === 0) {
-      await publishToTerminal(terminalId, "SYS:WL,EMPTY");
+      await sendCommandToTerminal(terminalId, "SYS:WL,EMPTY");
     } else {
       const wlChunks = buildChunks("SYS:WL,", whitelistUids, MAX_CHUNK_BYTES);
       for (let i = 0; i < wlChunks.length; i++) {
-        await publishToTerminal(terminalId, wlChunks[i]);
+        await sendCommandToTerminal(terminalId, wlChunks[i]);
         log.debug(
           { chunk: i + 1, total: wlChunks.length },
           "sync.wl_chunk_sent"
@@ -442,9 +471,9 @@ async function syncFullListsToTerminal(terminalId: string): Promise<void> {
     await sleep(SYNC_DELAY_MS);
 
     // 4. Signal completion
-    await publishToTerminal(
+    await sendCommandToTerminal(
       terminalId,
-      buildCommand(terminalId, "SYS:SYNC_COMPLETE")
+      "SYS:SYNC_COMPLETE"
     );
     log.info("sync.full_sync_complete");
   } catch (error) {

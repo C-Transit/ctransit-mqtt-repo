@@ -1,13 +1,22 @@
-import type { MqttClient } from "mqtt";
+import { randomUUID } from "node:crypto";
 import env from "../config/env.js";
-import type { Logger } from "pino";
 import logger from "../config/logger.js";
-import { commandTag } from "./downlinkQueue.js";
+import { getRedisClient, redisKeys } from "../config/redis.js";
 
 const POST_TIMEOUT_MS = 5000;
-const MAX_ATTEMPTS = 3;
-const BACKOFF_BASE_MS = 500;
-const CMD_PATTERN = /^CMD:([0-9a-f]{12});/;
+const RETRY_INTERVAL_MS = 5000;
+const LOCK_TTL_MS = 15000;
+const CMD_ID_PATTERN = /^CMD:([0-9a-f]{12});/;
+
+interface GsmOutboxItem {
+  deliveryId: string;
+  terminalId: string;
+  commandCsv: string;
+}
+
+function commandTag(command: string): string {
+  return command.replace(CMD_ID_PATTERN, "").split(",")[0];
+}
 
 function workerHost(): string | null {
   try {
@@ -17,29 +26,20 @@ function workerHost(): string | null {
   }
 }
 
-type PostResult = { done: boolean; retry: boolean; reason: string };
-
-function terminalIdFromTopic(topic: string): string | null {
-  const parts = topic.split("/");
-  if (parts.length !== 3 || parts[0] !== "ctransit" || parts[2] !== "rx") return null;
-  const id = parts[1].toUpperCase();
-  return id === "SERVER" ? null : id;
-}
-
-async function postToWorker(terminalId: string, commandCsv: string): Promise<PostResult> {
-  const tag = commandTag(commandCsv);
+async function postToWorker(item: GsmOutboxItem): Promise<boolean> {
   const webhookUrl = env.worker.webhookUrl?.trim();
   const webhookSecret = env.worker.webhookSecret?.trim();
 
   if (!webhookUrl || !webhookSecret) {
-    const missing: string[] = [];
-    if (!webhookUrl) missing.push("WORKER_WEBHOOK_URL");
-    if (!webhookSecret) missing.push("WORKER_WEBHOOK_SECRET");
-    return {
-      done: false,
-      retry: false,
-      reason: `config_missing:${missing.join(",")}`,
-    };
+    logger.error({
+      terminalId: item.terminalId,
+      deliveryId: item.deliveryId,
+      missing: [
+        ...(!webhookUrl ? ["WORKER_WEBHOOK_URL"] : []),
+        ...(!webhookSecret ? ["WORKER_WEBHOOK_SECRET"] : []),
+      ],
+    }, "gsm_downlink.worker_configuration_missing");
+    return false;
   }
 
   const controller = new AbortController();
@@ -51,106 +51,232 @@ async function postToWorker(terminalId: string, commandCsv: string): Promise<Pos
         "Content-Type": "application/json",
         "X-Worker-Secret": webhookSecret,
       },
-      body: JSON.stringify({ validatorId: terminalId, commandCsv }),
+      body: JSON.stringify({
+        validatorId: item.terminalId,
+        commandCsv: item.commandCsv,
+        deliveryId: item.deliveryId,
+      }),
       signal: controller.signal,
     });
-    const body = await res.text().catch(() => "");
-    if (res.ok || body.includes("ALREADY_QUEUED")) {
-      logger.debug({ terminalId, command: tag, webHookHost: workerHost() }, "gsm_downlink.worker_post_ok");
-      return { done: true, retry: false, reason: "ok" };
+    const body = await res.text();
+    let response: { puback?: unknown; deliveryId?: unknown } | null = null;
+    try {
+      response = JSON.parse(body) as { puback?: unknown; deliveryId?: unknown };
+    } catch {
+      response = null;
     }
-    if (res.status >= 400 && res.status < 500) {
-      return { done: false, retry: false, reason: `http_${res.status}` };
+
+    const acknowledged =
+      res.ok &&
+      response?.puback === true &&
+      response.deliveryId === item.deliveryId;
+    if (acknowledged) {
+      logger.info({
+        terminalId: item.terminalId,
+        deliveryId: item.deliveryId,
+        command: commandTag(item.commandCsv),
+        workerHost: workerHost(),
+      }, "gsm_downlink.puback_received");
+      return true;
     }
-    return { done: false, retry: true, reason: `http_${res.status}` };
+
+    logger.warn({
+      terminalId: item.terminalId,
+      deliveryId: item.deliveryId,
+      command: commandTag(item.commandCsv),
+      workerHost: workerHost(),
+      status: res.status,
+      pubackReceived: response?.puback === true,
+      acknowledgementIdMatches: response?.deliveryId === item.deliveryId,
+    }, "gsm_downlink.puback_missing_retrying");
+    return false;
   } catch (err) {
-    const aborted = err instanceof Error && err.name === "AbortError";
-    return { done: false, retry: true, reason: aborted ? "timeout" : "network" };
+    logger.warn({
+      terminalId: item.terminalId,
+      deliveryId: item.deliveryId,
+      command: commandTag(item.commandCsv),
+      workerHost: workerHost(),
+      reason:
+        err instanceof Error && err.name === "AbortError"
+          ? "timeout"
+          : err instanceof Error
+            ? err.message
+            : "unknown",
+    }, "gsm_downlink.worker_request_failed_retrying");
+    return false;
   } finally {
     clearTimeout(timer);
   }
 }
 
-async function forwardWithRetry(
+async function enqueueGsmDownlink(
   terminalId: string,
-  commandCsv: string,
-  log: Logger
+  commandCsv: string
 ): Promise<void> {
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    const r = await postToWorker(terminalId, commandCsv);
-    if (r.done) {
-      log.info({ attempt }, "gsm_downlink.forwarded");
-      return;
-    }
-    if (!r.retry) {
-      log.error(
-        {
-          attempt,
-          reason: r.reason,
-          workerConfigured: Boolean(env.worker.webhookUrl && env.worker.webhookSecret),
-          workerHost: workerHost(),
-        },
-        "gsm_downlink.rejected_by_worker"
-      );
-      return;
-    }
-    if (attempt === MAX_ATTEMPTS) break;
-    const backoffMs = BACKOFF_BASE_MS * 2 ** (attempt - 1);
-    log.warn(
-      {
-        attempt,
-        reason: r.reason,
-        backoffMs,
-        workerHost: workerHost(),
-      },
-      "gsm_downlink.retry_scheduled"
+  const item: GsmOutboxItem = {
+    terminalId: terminalId.toUpperCase(),
+    commandCsv,
+    deliveryId: `${terminalId.toUpperCase()}:${
+      CMD_ID_PATTERN.exec(commandCsv)?.[1] ?? randomUUID()
+    }`,
+  };
+  const redis = getRedisClient();
+  await redis.rpush(redisKeys.gsmOutbox, JSON.stringify(item));
+  logger.info({
+    terminalId: item.terminalId,
+    deliveryId: item.deliveryId,
+    command: commandTag(commandCsv),
+  }, "gsm_downlink.queued_for_worker");
+  void flushGsmOutbox().catch((err: unknown) => {
+    logger.error({
+      err: err instanceof Error ? err.message : "Unknown error",
+    }, "gsm_downlink.outbox_trigger_failed");
+  });
+}
+
+async function migrateQueuedGsmCommands(): Promise<void> {
+  const redis = getRedisClient();
+
+  for (const terminalId of env.cmdWrap.terminals) {
+    const queueKey = redisKeys.terminalQueue(terminalId);
+    const queuedCommands = await redis.lrange(queueKey, 0, -1);
+    if (queuedCommands.length === 0) continue;
+
+    const migrated = queuedCommands.map((commandCsv): GsmOutboxItem => ({
+      terminalId,
+      commandCsv,
+      deliveryId: `${terminalId}:${
+        CMD_ID_PATTERN.exec(commandCsv)?.[1] ?? randomUUID()
+      }`,
+    }));
+    const multi = redis.multi();
+    multi.rpush(
+      redisKeys.gsmOutbox,
+      ...migrated.map((item) => JSON.stringify(item))
     );
-    await new Promise((resolve) => setTimeout(resolve, backoffMs));
+    multi.del(queueKey);
+    const results = await multi.exec();
+    const failed = results?.find(([err]) => err);
+    if (!results || failed) {
+      throw failed?.[0] ?? new Error("GSM_QUEUE_MIGRATION_FAILED");
+    }
+
+    logger.info({
+      terminalId,
+      migratedCount: migrated.length,
+    }, "gsm_downlink.legacy_queue_migrated");
   }
-  log.error(
-    {
-      attempts: MAX_ATTEMPTS,
-      workerConfigured: Boolean(env.worker.webhookUrl && env.worker.webhookSecret),
-      workerHost: workerHost(),
-      terminalId,
-      commandTag: commandTag(commandCsv),
-    },
-    "gsm_downlink.forward_failed_permanently"
-  );
 }
 
-// One command at a time per terminal, so ADD:BL then REM:BL never swap order.
-const chains = new Map<string, Promise<void>>();
-function runInOrder(terminalId: string, job: () => Promise<void>): void {
-  const prev = chains.get(terminalId) ?? Promise.resolve();
-  const next = prev.then(job).catch(() => undefined);
-  chains.set(terminalId, next);
-  void next.then(() => {
-    if (chains.get(terminalId) === next) chains.delete(terminalId);
-  });
+let draining = false;
+let retryTimer: NodeJS.Timeout | null = null;
+
+async function flushGsmOutbox(): Promise<void> {
+  if (draining) return;
+  draining = true;
+  const redis = getRedisClient();
+  const lockToken = randomUUID();
+  let lockAcquired = false;
+  let shouldContinue = false;
+
+  try {
+    lockAcquired =
+      (await redis.set(
+        redisKeys.gsmOutboxLock,
+        lockToken,
+        "PX",
+        LOCK_TTL_MS,
+        "NX"
+      )) === "OK";
+    if (!lockAcquired) return;
+
+    const queued = await redis.lindex(redisKeys.gsmOutbox, 0);
+    if (!queued) return;
+
+    let item: GsmOutboxItem;
+    try {
+      item = JSON.parse(queued) as GsmOutboxItem;
+      if (
+        !item.deliveryId ||
+        !item.terminalId ||
+        typeof item.commandCsv !== "string"
+      ) {
+        throw new Error("Invalid GSM outbox item");
+      }
+    } catch (err) {
+      logger.error({
+        err: err instanceof Error ? err.message : "Unknown error",
+      }, "gsm_downlink.invalid_outbox_item");
+      return;
+    }
+
+    const acknowledged = await postToWorker(item);
+    if (acknowledged) {
+      const removed = await redis.lrem(redisKeys.gsmOutbox, 1, queued);
+      if (removed !== 1) {
+        logger.error({
+          terminalId: item.terminalId,
+          deliveryId: item.deliveryId,
+          removed,
+        }, "gsm_downlink.acknowledged_item_not_removed");
+      } else {
+        shouldContinue = true;
+      }
+    }
+  } catch (err) {
+    logger.error({
+      err: err instanceof Error ? err.message : "Unknown error",
+    }, "gsm_downlink.outbox_processing_failed");
+  } finally {
+    if (lockAcquired) {
+      await redis.eval(
+        "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end",
+        1,
+        redisKeys.gsmOutboxLock,
+        lockToken
+      ).catch((err: unknown) => {
+        logger.error({
+          err: err instanceof Error ? err.message : "Unknown error",
+        }, "gsm_downlink.outbox_lock_release_failed");
+      });
+    }
+    draining = false;
+    if (shouldContinue) {
+      void flushGsmOutbox().catch((err: unknown) => {
+        logger.error({
+          err: err instanceof Error ? err.message : "Unknown error",
+        }, "gsm_downlink.outbox_trigger_failed");
+      });
+    }
+  }
 }
 
-export function attachGsmDownlinkForwarder(client: MqttClient): void {
-  client.on("message", (topic, payload, packet) => {
-    const terminalId = terminalIdFromTopic(topic);
-    if (!terminalId) return;
-    if (packet.retain) return;
-    const commandCsv = payload.toString("utf8").trim();
-    const match = CMD_PATTERN.exec(commandCsv);
-    if (!match) return; // not a wrapped fleet command
-    const log = logger.child({
-      terminalId,
-      commandId: match[1],
-      commandLength: commandCsv.length,
-      workerConfigured: Boolean(env.worker.webhookUrl && env.worker.webhookSecret),
-      workerHost: workerHost(),
+async function startGsmDownlinkForwarder(): Promise<void> {
+  await migrateQueuedGsmCommands();
+  await flushGsmOutbox();
+  if (retryTimer) clearInterval(retryTimer);
+  retryTimer = setInterval(() => {
+    void flushGsmOutbox().catch((err: unknown) => {
+      logger.error({
+        err: err instanceof Error ? err.message : "Unknown error",
+      }, "gsm_downlink.outbox_retry_failed");
     });
-    log.info("gsm_downlink.received");
-    runInOrder(terminalId, () => forwardWithRetry(terminalId, commandCsv, log));
-  });
+  }, RETRY_INTERVAL_MS);
   logger.info({
     workerConfigured: Boolean(env.worker.webhookUrl && env.worker.webhookSecret),
     workerHost: workerHost(),
-    enabledTerminals: env.cmdWrap.terminals,
-  }, "gsm_downlink.forwarder_attached");
+    intervalMs: RETRY_INTERVAL_MS,
+  }, "gsm_downlink.outbox_started");
 }
+
+function stopGsmDownlinkForwarder(): void {
+  if (retryTimer) clearInterval(retryTimer);
+  retryTimer = null;
+}
+
+export {
+  enqueueGsmDownlink,
+  flushGsmOutbox,
+  startGsmDownlinkForwarder,
+  stopGsmDownlinkForwarder,
+};

@@ -66,6 +66,8 @@ function waitForRedisReady(client: Redis, timeoutMs = 10000): Promise<void> {
 const redisKeys = {
   terminalQueue: (terminalId: string): string =>
     `queue:${terminalId.toLowerCase()}`,
+  gsmOutbox: "queue:gsm:cloudflare",
+  gsmOutboxLock: "lock:gsm:cloudflare",
 };
 
 const cacheKeys = {

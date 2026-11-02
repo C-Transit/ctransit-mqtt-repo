@@ -3,7 +3,7 @@
 
 import prisma from "../lib/prisma.js";
 import type { PendingLinkData } from "../utils/parser.js";
-import { publishToTerminal } from "../mqtt/downlinkQueue.js";
+import { routeDownlinkToTerminal } from "../mqtt/downlinkQueue.js";
 import logger from "../config/logger.js";
 
 const OTP_TTL_MS = 5 * 60 * 1000; // 5 minutes
@@ -56,7 +56,7 @@ async function handlePendingLink(
   log.info({ expiresAt }, "registration.otp_saved_to_db");
 
   try {
-    await publishToTerminal(terminalId, `REG:OTP,${linkData.otp}`);
+    await routeDownlinkToTerminal(terminalId, `REG:OTP,${linkData.otp}`);
     log.info("registration.otp_sent_to_terminal_screen");
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : "Unknown error";

@@ -5,7 +5,6 @@ import logger from "../config/logger.js";
 import env from "../config/env.js";
 import { routeUplinkMessage } from "./uplinkRouter.js";
 import { injectClient } from "./downlinkQueue.js";
-import { attachGsmDownlinkForwarder } from "./gsmDownlinkForwarder.js";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let client: any = null;
@@ -24,8 +23,6 @@ function connectMqtt(): Promise<any> {
     client = mqtt.connect(mqttConfig.brokerUrl, {
       ...mqttConfig.options,
     });
-
-    attachGsmDownlinkForwarder(client);
 
     let settled = false;
 

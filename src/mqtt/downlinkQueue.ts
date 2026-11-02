@@ -2,6 +2,8 @@
 import type { MqttClient } from "mqtt";
 import mqttConfig from "../config/mqtt.js";
 import logger from "../config/logger.js";
+import env from "../config/env.js";
+import { enqueueGsmDownlink } from "./gsmDownlinkForwarder.js";
 
 let _client: MqttClient | null = null;
 
@@ -48,4 +50,21 @@ function publishToTerminal(terminalId: string, command: string): Promise<void> {
   });
 }
 
-export { injectClient, publishToTerminal, commandTag };
+async function routeDownlinkToTerminal(
+  terminalId: string,
+  command: string
+): Promise<void> {
+  const normalizedId = terminalId.toUpperCase();
+  if (env.cmdWrap.terminals.includes(normalizedId)) {
+    await enqueueGsmDownlink(normalizedId, command);
+    return;
+  }
+  await publishToTerminal(normalizedId, command);
+}
+
+export {
+  injectClient,
+  publishToTerminal,
+  routeDownlinkToTerminal,
+  commandTag,
+};
